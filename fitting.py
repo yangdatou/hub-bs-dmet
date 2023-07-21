@@ -301,6 +301,153 @@ def gen_loss_function_u(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
     # Return an instance of the class
     return f
 
+def gen_loss_function_g(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: numpy.ndarray,
+                                nelecs: Tuple[int, int], loss_func_type: int):
+    """
+    Generate the loss function for the fitting problem.
+
+    The meanfield is assumed to be general, meaning that the state is not the eigenstate of Sz or S2,
+    where electrons are singly occupied in orbitals without spin labels.
+
+    Args:
+        h1e (numpy.ndarray, shape=(nsite, nsite)):
+            The one-body Hamiltonian, assumed to be identical for alpha and beta electrons.
+        rdm1_tag (numpy.ndarray, shape=(nsite, nsite)):
+            The target total density matrix.
+        fit_inds (numpy.ndarray, shape=(nfrag, nimp)):
+            List of indices for the fitting problem. Each element of the list is a list of indices for a fragment.
+            The size of each fragment is assumed to be the same.
+        nelecs (Tuple[int, int]):
+            The number of alpha and beta electrons. The results may be different from the arguments
+            as the generalized Hartree-Fock problem will mix alpha and beta electrons.
+        loss_func_type (int):
+            The type of the loss function.
+            - 1: The loss function is the norm of the difference between the impurity block of the target
+                 and the fitted density matrix.
+            - 2: The loss function is the norm of the difference between the target and the fitted density matrix.
+
+    Returns:
+        f (LossFunctionMixin):
+            An instance of the LossFunctionMixin class containing:
+            - func: The loss function that takes the fitting parameters as input and returns the value of the loss function.
+            - grad: The gradient of the loss function.
+            - _fill_correlation_potential: A helper function to fill the correlation potential matrix. (for debugging purpose)
+            - _get_density_matrix: A helper function to get the density matrix. (for debugging purpose)
+    """
+
+    # Convert fit_inds to a JAX array and extract dimensions
+    fit_inds = jnumpy.asarray(fit_inds)
+    nfrag    = fit_inds.shape[0]
+    nimp     = fit_inds.shape[1]
+    nsite    = nimp * nfrag
+
+    ind_triu = jnumpy.triu_indices(nimp)
+    num_triu = ind_triu[0].shape[0]
+    num_parm = num_triu * 4
+
+    # Ensure that dimensions of f1e and rdm1_tag match expected dimensions
+    assert h1e.shape      == (nsite, nsite)
+    assert rdm1_tag.shape == (nsite, nsite)
+
+    # Build the one-body Hamiltonian for the problem
+    f1e = jnumpy.block([[h1e, jnumpy.zeros((nsite, nsite))], [jnumpy.zeros((nsite, nsite)), h1e]])
+
+    def fill_correlation_potential(x):
+        # Check that x has expected dimensions
+        assert x.shape == (num_parm,)
+
+        # Initialize potential with zeros
+        vaa = jnumpy.zeros((nsite, nsite))
+        vba = jnumpy.zeros((nsite, nsite))
+        vbb = jnumpy.zeros((nsite, nsite))
+        vab = jnumpy.zeros((nsite, nsite))
+
+        # Set values in the upper triangle of the correlation potential matrix for each fragment
+        for fit_ind in fit_inds:
+            ind_fit_0 = fit_ind[ind_triu[0]]
+            ind_fit_1 = fit_ind[ind_triu[1]]
+
+            vaa = vaa.at[ind_fit_0, ind_fit_1].set(x[:num_triu])
+            vba = vba.at[ind_fit_0, ind_fit_1].set(x[num_triu:2*num_triu])
+            vbb = vbb.at[ind_fit_0, ind_fit_1].set(x[2*num_triu:3*num_triu])
+            vab = vab.at[ind_fit_0, ind_fit_1].set(x[3*num_triu:])
+
+        # Symmetrize the correlation potential matrix
+        vaa_sym = vaa + jnumpy.transpose(vaa) - jnumpy.diag(jnumpy.diag(vaa))
+        vba_sym = vba + jnumpy.transpose(vba) - jnumpy.diag(jnumpy.diag(vba))
+        vbb_sym = vbb + jnumpy.transpose(vbb) - jnumpy.diag(jnumpy.diag(vbb))
+        vab_sym = vab + jnumpy.transpose(vab) - jnumpy.diag(jnumpy.diag(vab))
+        return jnumpy.array(((vaa_sym, vba_sym), (vab_sym, vbb_sym)))
+
+    def get_density_matrix(f1e):
+        # Solve the generalized Hartree-Fock problem to get MO energies and coefficients
+        mo_ene, mo_coeff = eigh(f1e)
+
+        # Select indices for occupied orbitals
+        occ_idx = jnumpy.argsort(mo_ene)[:sum(nelecs)]
+
+        # Obtain occupied MO coefficients
+        coeff_occ = mo_coeff[:, occ_idx]
+
+        # Calculate alpha and beta RDMs
+        rdm1_fit_g = jnumpy.dot(coeff_occ, coeff_occ.T)
+        rdm1_fit_alph = rdm1_fit_g[:nsite, :nsite]
+        rdm1_fit_beta = rdm1_fit_g[nsite:, nsite:]
+
+        return rdm1_fit_alph, rdm1_fit_beta
+
+    # Define the loss function based on the specified type
+    if loss_func_type == 1:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the norm of the RDM difference
+            err = jnumpy.linalg.norm(rdm1_err)
+            return err
+
+    elif loss_func_type == 2:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
+    else:
+        raise ValueError("Invalid loss function type.")
+
+    # Define a class with the loss function and its gradient, as well as the helper functions
+    class _LossFunctionMixin:
+        pass
+
+    f = _LossFunctionMixin()
+
+    # Main results
+    f.func = (lambda x: numpy.array(func(x)))
+    f.grad = (lambda x: numpy.array(jax.grad(func)(x)))
+    f.hess = (lambda x: numpy.array(jax.hessian(func)(x)))
+
+    # Helper functions
+    f._fill_correlation_potential = fill_correlation_potential
+    f._get_density_matrix         = get_density_matrix
+
+    # Other attributes
+    f._f1e      = f1e
+    f._ind_triu = ind_triu
+    f._num_triu = num_triu
+    f._num_parm = num_parm
+
+    # Return an instance of the class
+    return f
+
 from utils import print_matrix
 from utils import RestrictedElectronicStructureProblem
 
@@ -354,8 +501,8 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
 
     for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u]):
         for (nimp, loss_func_type) in [(2, 1), (2, 2), (nsite, 1)]:
-            # if is_debug and (not (nimp == 2 and loss_func_type == 2)):
-            #     continue
+            if is_debug and (not (nimp == 2 and loss_func_type == 2)):
+                continue
             
             f = gen_loss(
                 hub_obj.h1, rdm1_tag, nelecs=nelecs, loss_func_type=loss_func_type, 

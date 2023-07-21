@@ -354,7 +354,7 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
 
     for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u]):
         for (nimp, loss_func_type) in [(2, 1), (2, 2), (nsite, 1)]:
-            if is_debug and (not (igen_loss == 1 and nimp == 2 and loss_func_type == 2)):
+            if is_debug and (not (nimp == 2 and loss_func_type == 2)):
                 continue
             
             f = gen_loss(
@@ -406,12 +406,22 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
                 niter_success=100, interval=10, 
                 )
 
-            x = res.x
-
             print(f"\nLoss Function = {res.fun:6.4e}", file=log)
             print(f"Success = {res.lowest_optimization_result.success}", file=log)
             print(f"Message = {res.lowest_optimization_result.message}", file=log)
             print(f"Count = {count}", file=log)
             print(f"X = {res.x}", file=log)
             print(res, file=log)
+
+            x = res.x
+            f1e_fit  = f._f1e + f._fill_correlation_potential(x)
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(f._get_density_matrix(f1e_fit))
+            rdm1_err = jnumpy.abs(rdm1_tag - rdm1_fit)
+            err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+            err_max  = jnumpy.max(rdm1_err)
+
+            print_matrix(f1e_fit[0], t="f1e_fit  = ", stdout=log)
+            print_matrix(f1e_fit[1], t="f1e_fit  = ", stdout=log)
+            print_matrix(rdm1_fit,   t="rdm1_fit = ", stdout=log)
+            print_matrix(rdm1_tag,   t="rdm1_tag = ", stdout=log)
             print("\n\n" + "#"*20, file=log)

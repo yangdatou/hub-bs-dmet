@@ -354,8 +354,8 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
 
     for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u]):
         for (nimp, loss_func_type) in [(2, 1), (2, 2), (nsite, 1)]:
-            if is_debug and (not (nimp == 2 and loss_func_type == 2)):
-                continue
+            # if is_debug and (not (nimp == 2 and loss_func_type == 2)):
+            #     continue
             
             f = gen_loss(
                 hub_obj.h1, rdm1_tag, nelecs=nelecs, loss_func_type=loss_func_type, 

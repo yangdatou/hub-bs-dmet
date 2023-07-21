@@ -128,6 +128,19 @@ def gen_loss_function_r(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
             return err
 
+    elif loss_func_type == 3:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err  = jnumpy.linalg.norm(rdm1_err)
+            err += sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
     else:
         raise ValueError("Invalid loss function type.")
 
@@ -274,6 +287,18 @@ def gen_loss_function_u(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
             return err
 
+    elif loss_func_type == 3:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err  = jnumpy.linalg.norm(rdm1_err)
+            err += sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
     else:
         raise ValueError("Invalid loss function type.")
 
@@ -421,6 +446,19 @@ def gen_loss_function_g(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
             return err
 
+    elif loss_func_type == 3:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err  = jnumpy.linalg.norm(rdm1_err)
+            err += sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
     else:
         raise ValueError("Invalid loss function type.")
 
@@ -499,8 +537,8 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
         print_matrix(u_rdm1[0], t="u_rdm1_alph = ", stdout=log)
         print_matrix(u_rdm1[1], t="u_rdm1_beta = ", stdout=log)
 
-    for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u]):
-        for (nimp, loss_func_type) in [(2, 1), (2, 2), (nsite, 1)]:
+    for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u, gen_loss_function_g]):
+        for (nimp, loss_func_type) in [(2, 1), (2, 2), (2, 3), (nsite, 1)]:
             if is_debug and (not (nimp == 2 and loss_func_type == 2)):
                 continue
             
@@ -553,19 +591,19 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
                 niter_success=100, interval=10, 
                 )
 
-            print(f"\nLoss Function = {res.fun:6.4e}", file=log)
-            print(f"Success = {res.lowest_optimization_result.success}", file=log)
-            print(f"Message = {res.lowest_optimization_result.message}", file=log)
-            print(f"Count = {count}", file=log)
-            print(f"X = {res.x}", file=log)
-            print(res, file=log)
-
             x = res.x
             f1e_fit  = f._f1e + f._fill_correlation_potential(x)
             rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(f._get_density_matrix(f1e_fit))
             rdm1_err = jnumpy.abs(rdm1_tag - rdm1_fit)
             err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
             err_max  = jnumpy.max(rdm1_err)
+
+            print(f"\nLoss Function = {y:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+            print(f"Success = {res.lowest_optimization_result.success}", file=log)
+            print(f"Message = {res.lowest_optimization_result.message}", file=log)
+            print(f"x = " + " ".join([f"{xi:6.4f}" for xi in x]), file=log)
+            
+            print(res, file=log)
 
             print_matrix(rdm1_fit,   t="rdm1_fit = ", stdout=log)
             print_matrix(rdm1_tag,   t="rdm1_tag = ", stdout=log)

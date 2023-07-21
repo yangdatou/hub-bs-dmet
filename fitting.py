@@ -420,8 +420,6 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
             err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
             err_max  = jnumpy.max(rdm1_err)
 
-            print_matrix(f1e_fit[0], t="f1e_fit  = ", stdout=log)
-            print_matrix(f1e_fit[1], t="f1e_fit  = ", stdout=log)
             print_matrix(rdm1_fit,   t="rdm1_fit = ", stdout=log)
             print_matrix(rdm1_tag,   t="rdm1_tag = ", stdout=log)
             print("\n\n" + "#"*20, file=log)

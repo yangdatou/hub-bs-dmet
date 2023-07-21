@@ -109,7 +109,7 @@ def gen_loss_function_r(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             # Fill the correlation potential and calculate f1e
             f1e_fit  = f1e + fill_correlation_potential(x)
             # Obtain the total RDM
-            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
             # Calculate the difference between the target and fitted RDMs
             rdm1_err = rdm1_tag - rdm1_fit
             # The loss function is the norm of the RDM difference
@@ -121,7 +121,7 @@ def gen_loss_function_r(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             # Fill the correlation potential and calculate f1e
             f1e_fit  = f1e + fill_correlation_potential(x)
             # Obtain the total RDM
-            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
             # Calculate the difference between the target and fitted RDMs
             rdm1_err = rdm1_tag - rdm1_fit
             # The loss function is the sum of the norms of the RDM differences for each fragment
@@ -131,7 +131,7 @@ def gen_loss_function_r(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
     else:
         raise ValueError("Invalid loss function type.")
 
-    # Define a class with the loss function and its gradient, as well as the helper functions
+    # Define a class with the loss function and its gradient, as well as the heler functions
     class _LossFunctionMixin:
         pass
 
@@ -255,7 +255,7 @@ def gen_loss_function_u(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             # Fill the correlation potential and calculate f1e
             f1e_fit  = f1e + fill_correlation_potential(x)
             # Obtain the total RDM
-            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
             # Calculate the difference between the target and fitted RDMs
             rdm1_err = rdm1_tag - rdm1_fit
             # The loss function is the norm of the RDM difference
@@ -267,7 +267,7 @@ def gen_loss_function_u(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: n
             # Fill the correlation potential and calculate f1e
             f1e_fit  = f1e + fill_correlation_potential(x)
             # Obtain the total RDM
-            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e_fit))
             # Calculate the difference between the target and fitted RDMs
             rdm1_err = rdm1_tag - rdm1_fit
             # The loss function is the sum of the norms of the RDM differences for each fragment
@@ -379,23 +379,34 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
                 err_max  = jnumpy.max(rdm1_err)
 
                 global count
+                if is_debug:
+                    print(f"\nLoss Function = {y:6.4e}, {f.func(x):6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}")
+                    print(f"x = " + " ".join([f"{xi:6.4f}" for xi in x]))
+                #     print_matrix(f1e_fit[0], t="f1e_fit  = ")
+                #     print_matrix(f1e_fit[1], t="f1e_fit  = ")
+                #     print_matrix(rdm1_fit,   t="rdm1_fit = ")
+                #     print_matrix(rdm1_err,   t="rdm1_err = ")
+                #     assert count != 10
+                
                 print(f"Loss Function = {y:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
                 count += 1
 
             kwargs = {
                 "method": "bfgs", 
                 "jac": f.grad, 
-                "tol": 1e-6, 
+                "tol": 1e-4, 
                 "options": {"disp": False, "maxiter": 1000}
                 }
 
-            x0 = numpy.zeros(f._num_parm) + 0.1 * numpy.random.rand(f._num_parm)
+            x0 = numpy.zeros(f._num_parm)
 
             res = basinhopping(
                 f.func, x0, niter=1000, T=0.1, stepsize=0.6, disp=False,
                 callback=callback, minimizer_kwargs=kwargs, 
                 niter_success=100, interval=10, 
                 )
+
+            x = res.x
 
             print(f"\nLoss Function = {res.fun:6.4e}", file=log)
             print(f"Success = {res.lowest_optimization_result.success}", file=log)

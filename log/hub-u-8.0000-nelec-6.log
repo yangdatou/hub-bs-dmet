@@ -1,0 +1,1223 @@
+#INFO: **** input file is /Users/yangjunjie/work/hub-bs-dmet/fitting.py ****
+import os, sys, typing
+from typing import List, Tuple, Callable
+sys.path.append(".")
+
+from functools import reduce
+
+import numpy, scipy
+from scipy import linalg
+from scipy.optimize import basinhopping
+
+import jax
+import jax.numpy as jnumpy
+from jax.scipy.linalg import eigh
+from jax.scipy.optimize import minimize
+
+def gen_loss_function_r(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: numpy.ndarray,
+                             nelecs: Tuple[int, int], loss_func_type: int):
+    """
+    Generate the loss function for the fitting problem.
+
+    The meanfield is assumed to be restricted, meaning that the state is the eigenstate of Sz and S2,
+    where the alpha and beta electrons are doubly occupied in the same set of orbitals.
+
+    Args:
+        h1e (numpy.ndarray, shape=(nsite, nsite)):
+            The one-body Hamiltonian, assumed to be identical for alpha and beta electrons.
+        rdm1_tag (numpy.ndarray, shape=(nsite, nsite)):
+            The target total density matrix.
+        fit_inds (numpy.ndarray, shape=(nfrag, nimp)):
+            List of indices for the fitting problem. Each element of the list is a list of indices for a fragment.
+            The size of each fragment is assumed to be the same.
+        nelecs (Tuple[int, int]):
+            The number of alpha and beta electrons.
+        loss_func_type (int):
+            The type of the loss function.
+            - 1: The loss function is the norm of the difference between the impurity block of the target
+                 and the fitted density matrix.
+            - 2: The loss function is the norm of the difference between the target and the fitted density matrix.
+
+    Returns:
+        f (LossFunctionMixin):
+            An instance of the LossFunctionMixin class containing:
+            - func: The loss function that takes the fitting parameters as input and returns the value of the loss function.
+            - grad: The gradient of the loss function.
+            - _fill_correlation_potential: A helper function to fill the correlation potential matrix. (for debugging purpose)
+            - _get_density_matrix: A helper function to get the density matrix. (for debugging purpose)
+    """
+    # Convert fit_inds to a JAX array and extract dimensions
+    fit_inds = jnumpy.asarray(fit_inds)
+    nfrag    = fit_inds.shape[0]
+    nimp     = fit_inds.shape[1]
+    nsite    = nimp * nfrag
+
+    ind_triu = jnumpy.triu_indices(nimp)
+    num_triu = ind_triu[0].shape[0]
+    num_parm = num_triu
+
+    # Ensure that dimensions of f1e and rdm1_tag match expected dimensions
+    assert h1e.shape      == (nsite, nsite)
+    assert rdm1_tag.shape == (nsite, nsite)
+
+    # Build the one-body Hamiltonian for the problem
+    f1e = jnumpy.array(h1e)
+
+    def fill_correlation_potential(x):
+        # Generate indices for the upper triangle
+
+        # Check that x has expected dimensions
+        assert x.shape == (num_triu,)
+
+        # Initialize potential with zeros
+        v = jnumpy.zeros((nsite, nsite))
+
+        # Set values in the upper triangle of the correlation potential matrix for each fragment
+        for fit_ind in fit_inds:
+            ind_fit_0 = fit_ind[ind_triu[0]]
+            ind_fit_1 = fit_ind[ind_triu[1]]
+            v = v.at[ind_fit_0, ind_fit_1].set(x)
+
+        # Symmetrize the correlation potential matrix
+        v_sym = v + jnumpy.transpose(v) - jnumpy.diag(jnumpy.diag(v))
+        return v_sym
+
+    def get_density_matrix(f1e):
+        # Ensure that the number of alpha and beta electrons are the same
+        assert nelecs[0] == nelecs[1]
+
+        # Solve the restricted Hartree-Fock problem to get MO energies and coefficients
+        mo_ene_alph, mo_coeff_alph = eigh(f1e)
+        mo_ene_beta, mo_coeff_beta = mo_ene_alph, mo_coeff_alph
+
+        # Select indices for occupied orbitals
+        occ_idx_alph = jnumpy.argsort(mo_ene_alph)[:nelecs[0]]
+        occ_idx_beta = jnumpy.argsort(mo_ene_beta)[:nelecs[1]]
+
+        # Obtain occupied MO coefficients
+        coeff_occ_alph = mo_coeff_alph[:, occ_idx_alph]
+        coeff_occ_beta = mo_coeff_beta[:, occ_idx_beta]
+
+        # Calculate alpha and beta RDMs
+        rdm1_fit_alph  = jnumpy.dot(coeff_occ_alph, coeff_occ_alph.T)
+        rdm1_fit_beta  = jnumpy.dot(coeff_occ_beta, coeff_occ_beta.T)
+
+        return rdm1_fit_alph, rdm1_fit_beta
+
+    # Define the loss function based on the specified type
+    if loss_func_type == 1:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the norm of the RDM difference
+            err = jnumpy.linalg.norm(rdm1_err)
+            return err
+
+    elif loss_func_type == 2:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
+    else:
+        raise ValueError("Invalid loss function type.")
+
+    # Define a class with the loss function and its gradient, as well as the helper functions
+    class _LossFunctionMixin:
+        pass
+
+    f = _LossFunctionMixin()
+
+    # Main results
+    f.func = (lambda x: numpy.array(func(x)))
+    f.grad = (lambda x: numpy.array(jax.grad(func)(x)))
+    f.hess = (lambda x: numpy.array(jax.hessian(func)(x)))
+
+    # Helper functions
+    f._fill_correlation_potential = fill_correlation_potential
+    f._get_density_matrix         = get_density_matrix
+
+    # Other attributes
+    f._f1e      = f1e
+    f._ind_triu = ind_triu
+    f._num_triu = num_triu
+    f._num_parm = num_parm
+
+    # Return an instance of the class
+    return f
+
+def gen_loss_function_u(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: numpy.ndarray,
+                             nelecs: Tuple[int, int], loss_func_type: int):
+    """
+    Generate the loss function for the fitting problem.
+
+    The meanfield is assumed to be unrestricted, meaning that the state is the eigenstate of Sz but not S2,
+    where the alpha and beta electrons are singly occupied in (possibly) different orbitals.
+
+    Args:
+        h1e (numpy.ndarray, shape=(nsite, nsite)):
+            The one-body Hamiltonian, assumed to be identical for alpha and beta electrons.
+        rdm1_tag (numpy.ndarray, shape=(nsite, nsite)):
+            The target total density matrix.
+        fit_inds (numpy.ndarray, shape=(nfrag, nimp)):
+            List of indices for the fitting problem. Each element of the list is a list of indices for a fragment.
+            The size of each fragment is assumed to be the same.
+        nelecs (Tuple[int, int]):
+            The number of alpha and beta electrons.
+        loss_func_type (int):
+            The type of the loss function.
+            - 1: The loss function is the norm of the difference between the impurity block of the target
+                 and the fitted density matrix.
+            - 2: The loss function is the norm of the difference between the target and the fitted density matrix.
+
+    Returns:
+        f (LossFunctionMixin):
+            An instance of the LossFunctionMixin class containing:
+            - func: The loss function that takes the fitting parameters as input and returns the value of the loss function.
+            - grad: The gradient of the loss function.
+            - _fill_correlation_potential: A helper function to fill the correlation potential matrix. (for debugging purpose)
+            - _get_density_matrix: A helper function to get the density matrix. (for debugging purpose)
+    """
+    # Convert fit_inds to a JAX array and extract dimensions
+    fit_inds = jnumpy.asarray(fit_inds)
+    nfrag    = fit_inds.shape[0]
+    nimp     = fit_inds.shape[1]
+    nsite    = nimp * nfrag
+
+    ind_triu = jnumpy.triu_indices(nimp)
+    num_triu = ind_triu[0].shape[0]
+    num_parm = num_triu * 2
+
+    # Ensure that dimensions of f1e and rdm1_tag match expected dimensions
+    assert h1e.shape      == (nsite, nsite)
+    assert rdm1_tag.shape == (nsite, nsite)
+
+    # Build the one-body Hamiltonian for the problem
+    f1e = jnumpy.array((h1e, h1e))
+
+    def fill_correlation_potential(x):
+        # Generate indices for the upper triangle
+
+        # Check that x has expected dimensions
+        assert x.shape == (num_parm,)
+
+        # Initialize potential with zeros
+        va = jnumpy.zeros((nsite, nsite))
+        vb = jnumpy.zeros((nsite, nsite))
+
+        # Set values in the upper triangle of the correlation potential matrix for each fragment
+        for fit_ind in fit_inds:
+            ind_fit_0 = fit_ind[ind_triu[0]]
+            ind_fit_1 = fit_ind[ind_triu[1]]
+
+            va = va.at[ind_fit_0, ind_fit_1].set(x[:num_triu])
+            vb = vb.at[ind_fit_0, ind_fit_1].set(x[num_triu:])
+
+        # Symmetrize the correlation potential matrix
+        va_sym = va + jnumpy.transpose(va) - jnumpy.diag(jnumpy.diag(va))
+        vb_sym = vb + jnumpy.transpose(vb) - jnumpy.diag(jnumpy.diag(vb))
+        return jnumpy.array((va_sym, vb_sym))
+
+    def get_density_matrix(f1e):
+        # Ensure that the number of alpha and beta electrons are the same
+        assert nelecs[0] == nelecs[1]
+
+        # Solve the restricted Hartree-Fock problem to get MO energies and coefficients
+        mo_ene_alph, mo_coeff_alph = eigh(f1e[0])
+        mo_ene_beta, mo_coeff_beta = eigh(f1e[1])
+
+        # Select indices for occupied orbitals
+        occ_idx_alph = jnumpy.argsort(mo_ene_alph)[:nelecs[0]]
+        occ_idx_beta = jnumpy.argsort(mo_ene_beta)[:nelecs[1]]
+
+        # Obtain occupied MO coefficients
+        coeff_occ_alph = mo_coeff_alph[:, occ_idx_alph]
+        coeff_occ_beta = mo_coeff_beta[:, occ_idx_beta]
+
+        # Calculate alpha and beta RDMs
+        rdm1_fit_alph  = jnumpy.dot(coeff_occ_alph, coeff_occ_alph.T)
+        rdm1_fit_beta  = jnumpy.dot(coeff_occ_beta, coeff_occ_beta.T)
+
+        return rdm1_fit_alph, rdm1_fit_beta
+
+    # Define the loss function based on the specified type
+    if loss_func_type == 1:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the norm of the RDM difference
+            err = jnumpy.linalg.norm(rdm1_err)
+            return err
+
+    elif loss_func_type == 2:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
+    else:
+        raise ValueError("Invalid loss function type.")
+
+    # Define a class with the loss function and its gradient, as well as the helper functions
+    class _LossFunctionMixin:
+        pass
+
+    f = _LossFunctionMixin()
+
+    # Main results
+    f.func = (lambda x: numpy.array(func(x)))
+    f.grad = (lambda x: numpy.array(jax.grad(func)(x)))
+    f.hess = (lambda x: numpy.array(jax.hessian(func)(x)))
+
+    # Helper functions
+    f._fill_correlation_potential = fill_correlation_potential
+    f._get_density_matrix         = get_density_matrix
+
+    # Other attributes
+    f._f1e      = f1e
+    f._ind_triu = ind_triu
+    f._num_triu = num_triu
+    f._num_parm = num_parm
+
+    # Return an instance of the class
+    return f
+
+from utils import print_matrix
+from utils import RestrictedElectronicStructureProblem
+
+from utils import solve_restricted_hartree_fock
+from utils import solve_unrestricted_hartree_fock
+from utils import solve_direct_spin1_full_configuration_interaction
+
+from hub import build_hub_model
+hub_u = 8.0
+nsite  = 6
+is_debug = True
+
+for nelecs in [(2, 2), (3, 3), (4, 4)]:
+    if is_debug and (not nelecs == (3, 3)):
+        continue
+
+    log = open(f"./log/hub-u-{hub_u:6.4f}-nelec-{nelecs[0]+nelecs[1]}" + ".log", "w")
+
+    hub_obj         = build_hub_model(nsite, nelecs, hub_u)
+    hub_obj.verbose = 4
+    hub_obj.stdout  = log
+    dm0_alph, dm0_beta = (lambda xs: (numpy.diag(xs[0]), numpy.diag(xs[1][::-1])))(numpy.asarray([[1, 0] for _ in range(nsite)]).reshape(2, -1))
+
+    res_rhf = solve_restricted_hartree_fock(hub_obj,   dm0=dm0_alph+dm0_beta)
+    res_uhf = solve_unrestricted_hartree_fock(hub_obj, dm0=(dm0_alph, dm0_beta))
+    res_fci = solve_direct_spin1_full_configuration_interaction(hub_obj)
+
+    ene_rhf = res_rhf.get_ene()
+    ene_uhf = res_uhf.get_ene()
+    ene_fci = res_fci.get_ene()
+
+    r_rdm1_rhf = res_rhf.get_r_rdm1()
+    r_rdm1_uhf = res_uhf.get_r_rdm1()
+    r_rdm1_fci = res_fci.get_r_rdm1()
+    rdm1_tag   = r_rdm1_fci
+
+    for res in [res_rhf, res_uhf, res_fci]:
+        ene    = res.get_ene()
+        r_rdm1 = res.get_r_rdm1()
+        u_rdm1 = res.get_u_rdm1()
+        err    = numpy.linalg.norm(r_rdm1_fci - r_rdm1) / numpy.size(r_rdm1_fci)
+
+        print(f"\n\n{res.__class__.__name__}", file=log)
+        print(f"ene = {ene:12.8f}, dm_err = {err:12.8f}", file=log)
+        print_matrix(r_rdm1,    t="r_rdm1 = ", stdout=log)
+        print_matrix(u_rdm1[0], t="u_rdm1_alph = ", stdout=log)
+        print_matrix(u_rdm1[1], t="u_rdm1_beta = ", stdout=log)
+
+    for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u]):
+        for (nimp, loss_func_type) in [(2, 1), (2, 2), (nsite, 1)]:
+            if is_debug and (not (igen_loss == 1 and nimp == 2 and loss_func_type == 1)):
+                continue
+            
+            f = gen_loss(
+                hub_obj.h1, rdm1_tag, nelecs=nelecs, loss_func_type=loss_func_type, 
+                fit_inds=numpy.asarray([[i+ifrag*nimp for i in range(nimp)] for ifrag in range(nsite // nimp)])
+                )
+
+            print("\n\n" + "#"*20, file=log)
+            print(f"{gen_loss.__name__}", file=log)
+            print(f"nimp = {nimp}, nsite = {nsite}", file=log)
+            print(f"nelecs = {nelecs}", file=log)
+            print(f"loss_func_type = {loss_func_type}", file=log)
+
+            global count
+            count = 0
+
+            def callback(x, y, accepted):
+                f1e_fit  = f._f1e + f._fill_correlation_potential(x)
+                rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(f._get_density_matrix(f1e_fit))
+                rdm1_err = jnumpy.abs(rdm1_tag - rdm1_fit)
+                err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+                err_max  = jnumpy.max(rdm1_err)
+
+                global count
+                print(f"Loss Function = {y:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+                count += 1
+
+            kwargs = {
+                "method": "bfgs", 
+                "jac": f.grad, 
+                "tol": 1e-6, 
+                "options": {"disp": False, "maxiter": 1000}
+                }
+
+            x0 = numpy.zeros(f._num_parm) + 0.1 * numpy.random.rand(f._num_parm)
+
+            res = basinhopping(
+                f.func, x0, niter=1000, T=0.1, stepsize=0.6, disp=False,
+                callback=callback, minimizer_kwargs=kwargs, 
+                niter_success=100, interval=10, 
+                )
+
+            print(f"\nLoss Function = {res.fun:6.4e}", file=log)
+            print(f"Success = {res.lowest_optimization_result.success}", file=log)
+            print(f"Message = {res.lowest_optimization_result.message}", file=log)
+            print(f"Count = {count}", file=log)
+            print(f"X = {res.x}", file=log)
+            print(res, file=log)
+            print("\n\n" + "#"*20, file=log)#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Darwin', node='Junjies-MacBook-Air.local', release='22.5.0', version='Darwin Kernel Version 22.5.0: Thu Jun  8 22:21:34 PDT 2023; root:xnu-8796.121.3~7/RELEASE_ARM64_T8112', machine='arm64')  Threads 1
+Python 3.11.3 | packaged by conda-forge | (main, Apr  6 2023, 08:58:31) [Clang 14.0.6 ]
+numpy 1.24.3  scipy 1.10.1
+Date: Thu Jul 20 20:36:37 2023
+PySCF version 2.2.1
+PySCF path  /Users/yangjunjie/packages/pyscf/pyscf-2.2.1/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 0
+[INPUT] num. electrons = 6
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+
+nuclear repulsion = 0
+number of shells = 0
+number of NR pGTOs = 0
+number of NR cGTOs = 0
+basis = sto-3g
+ecp = {}
+CPU time:         0.45
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-06
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /var/folders/14/127wb84x5yx1jh4dxrvgcfkm0000gn/T/tmpkddbcu1k
+max_memory 4000 MB (current use 0 MB)
+Overwritten attributes  get_hcore get_ovlp  of <class 'pyscf.scf.hf.RHF'>
+Set gradient conv threshold to 0.001
+init E= 12
+  HOMO = 3  LUMO = 5
+cycle= 1 E= 3.99999999999999  delta_E=   -8  |g|= 7.41e-15  |ddm|= 2.45
+  HOMO = 3  LUMO = 5
+cycle= 2 E= 4.00000000000001  delta_E= 2.13e-14  |g|= 1.29e-14  |ddm|= 5.62e-15
+  HOMO = 3  LUMO = 5
+Extra cycle  E= 4  delta_E= -1.42e-14  |g|= 4.32e-14  |ddm|= 8.98e-15
+converged SCF energy = 4
+#INFO: **** input file is /Users/yangjunjie/work/hub-bs-dmet/fitting.py ****
+import os, sys, typing
+from typing import List, Tuple, Callable
+sys.path.append(".")
+
+from functools import reduce
+
+import numpy, scipy
+from scipy import linalg
+from scipy.optimize import basinhopping
+
+import jax
+import jax.numpy as jnumpy
+from jax.scipy.linalg import eigh
+from jax.scipy.optimize import minimize
+
+def gen_loss_function_r(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: numpy.ndarray,
+                             nelecs: Tuple[int, int], loss_func_type: int):
+    """
+    Generate the loss function for the fitting problem.
+
+    The meanfield is assumed to be restricted, meaning that the state is the eigenstate of Sz and S2,
+    where the alpha and beta electrons are doubly occupied in the same set of orbitals.
+
+    Args:
+        h1e (numpy.ndarray, shape=(nsite, nsite)):
+            The one-body Hamiltonian, assumed to be identical for alpha and beta electrons.
+        rdm1_tag (numpy.ndarray, shape=(nsite, nsite)):
+            The target total density matrix.
+        fit_inds (numpy.ndarray, shape=(nfrag, nimp)):
+            List of indices for the fitting problem. Each element of the list is a list of indices for a fragment.
+            The size of each fragment is assumed to be the same.
+        nelecs (Tuple[int, int]):
+            The number of alpha and beta electrons.
+        loss_func_type (int):
+            The type of the loss function.
+            - 1: The loss function is the norm of the difference between the impurity block of the target
+                 and the fitted density matrix.
+            - 2: The loss function is the norm of the difference between the target and the fitted density matrix.
+
+    Returns:
+        f (LossFunctionMixin):
+            An instance of the LossFunctionMixin class containing:
+            - func: The loss function that takes the fitting parameters as input and returns the value of the loss function.
+            - grad: The gradient of the loss function.
+            - _fill_correlation_potential: A helper function to fill the correlation potential matrix. (for debugging purpose)
+            - _get_density_matrix: A helper function to get the density matrix. (for debugging purpose)
+    """
+    # Convert fit_inds to a JAX array and extract dimensions
+    fit_inds = jnumpy.asarray(fit_inds)
+    nfrag    = fit_inds.shape[0]
+    nimp     = fit_inds.shape[1]
+    nsite    = nimp * nfrag
+
+    ind_triu = jnumpy.triu_indices(nimp)
+    num_triu = ind_triu[0].shape[0]
+    num_parm = num_triu
+
+    # Ensure that dimensions of f1e and rdm1_tag match expected dimensions
+    assert h1e.shape      == (nsite, nsite)
+    assert rdm1_tag.shape == (nsite, nsite)
+
+    # Build the one-body Hamiltonian for the problem
+    f1e = jnumpy.array(h1e)
+
+    def fill_correlation_potential(x):
+        # Generate indices for the upper triangle
+
+        # Check that x has expected dimensions
+        assert x.shape == (num_triu,)
+
+        # Initialize potential with zeros
+        v = jnumpy.zeros((nsite, nsite))
+
+        # Set values in the upper triangle of the correlation potential matrix for each fragment
+        for fit_ind in fit_inds:
+            ind_fit_0 = fit_ind[ind_triu[0]]
+            ind_fit_1 = fit_ind[ind_triu[1]]
+            v = v.at[ind_fit_0, ind_fit_1].set(x)
+
+        # Symmetrize the correlation potential matrix
+        v_sym = v + jnumpy.transpose(v) - jnumpy.diag(jnumpy.diag(v))
+        return v_sym
+
+    def get_density_matrix(f1e):
+        # Ensure that the number of alpha and beta electrons are the same
+        assert nelecs[0] == nelecs[1]
+
+        # Solve the restricted Hartree-Fock problem to get MO energies and coefficients
+        mo_ene_alph, mo_coeff_alph = eigh(f1e)
+        mo_ene_beta, mo_coeff_beta = mo_ene_alph, mo_coeff_alph
+
+        # Select indices for occupied orbitals
+        occ_idx_alph = jnumpy.argsort(mo_ene_alph)[:nelecs[0]]
+        occ_idx_beta = jnumpy.argsort(mo_ene_beta)[:nelecs[1]]
+
+        # Obtain occupied MO coefficients
+        coeff_occ_alph = mo_coeff_alph[:, occ_idx_alph]
+        coeff_occ_beta = mo_coeff_beta[:, occ_idx_beta]
+
+        # Calculate alpha and beta RDMs
+        rdm1_fit_alph  = jnumpy.dot(coeff_occ_alph, coeff_occ_alph.T)
+        rdm1_fit_beta  = jnumpy.dot(coeff_occ_beta, coeff_occ_beta.T)
+
+        return rdm1_fit_alph, rdm1_fit_beta
+
+    # Define the loss function based on the specified type
+    if loss_func_type == 1:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the norm of the RDM difference
+            err = jnumpy.linalg.norm(rdm1_err)
+            return err
+
+    elif loss_func_type == 2:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
+    else:
+        raise ValueError("Invalid loss function type.")
+
+    # Define a class with the loss function and its gradient, as well as the helper functions
+    class _LossFunctionMixin:
+        pass
+
+    f = _LossFunctionMixin()
+
+    # Main results
+    f.func = (lambda x: numpy.array(func(x)))
+    f.grad = (lambda x: numpy.array(jax.grad(func)(x)))
+    f.hess = (lambda x: numpy.array(jax.hessian(func)(x)))
+
+    # Helper functions
+    f._fill_correlation_potential = fill_correlation_potential
+    f._get_density_matrix         = get_density_matrix
+
+    # Other attributes
+    f._f1e      = f1e
+    f._ind_triu = ind_triu
+    f._num_triu = num_triu
+    f._num_parm = num_parm
+
+    # Return an instance of the class
+    return f
+
+def gen_loss_function_u(h1e: numpy.ndarray, rdm1_tag: numpy.ndarray, fit_inds: numpy.ndarray,
+                             nelecs: Tuple[int, int], loss_func_type: int):
+    """
+    Generate the loss function for the fitting problem.
+
+    The meanfield is assumed to be unrestricted, meaning that the state is the eigenstate of Sz but not S2,
+    where the alpha and beta electrons are singly occupied in (possibly) different orbitals.
+
+    Args:
+        h1e (numpy.ndarray, shape=(nsite, nsite)):
+            The one-body Hamiltonian, assumed to be identical for alpha and beta electrons.
+        rdm1_tag (numpy.ndarray, shape=(nsite, nsite)):
+            The target total density matrix.
+        fit_inds (numpy.ndarray, shape=(nfrag, nimp)):
+            List of indices for the fitting problem. Each element of the list is a list of indices for a fragment.
+            The size of each fragment is assumed to be the same.
+        nelecs (Tuple[int, int]):
+            The number of alpha and beta electrons.
+        loss_func_type (int):
+            The type of the loss function.
+            - 1: The loss function is the norm of the difference between the impurity block of the target
+                 and the fitted density matrix.
+            - 2: The loss function is the norm of the difference between the target and the fitted density matrix.
+
+    Returns:
+        f (LossFunctionMixin):
+            An instance of the LossFunctionMixin class containing:
+            - func: The loss function that takes the fitting parameters as input and returns the value of the loss function.
+            - grad: The gradient of the loss function.
+            - _fill_correlation_potential: A helper function to fill the correlation potential matrix. (for debugging purpose)
+            - _get_density_matrix: A helper function to get the density matrix. (for debugging purpose)
+    """
+    # Convert fit_inds to a JAX array and extract dimensions
+    fit_inds = jnumpy.asarray(fit_inds)
+    nfrag    = fit_inds.shape[0]
+    nimp     = fit_inds.shape[1]
+    nsite    = nimp * nfrag
+
+    ind_triu = jnumpy.triu_indices(nimp)
+    num_triu = ind_triu[0].shape[0]
+    num_parm = num_triu * 2
+
+    # Ensure that dimensions of f1e and rdm1_tag match expected dimensions
+    assert h1e.shape      == (nsite, nsite)
+    assert rdm1_tag.shape == (nsite, nsite)
+
+    # Build the one-body Hamiltonian for the problem
+    f1e = jnumpy.array((h1e, h1e))
+
+    def fill_correlation_potential(x):
+        # Generate indices for the upper triangle
+
+        # Check that x has expected dimensions
+        assert x.shape == (num_parm,)
+
+        # Initialize potential with zeros
+        va = jnumpy.zeros((nsite, nsite))
+        vb = jnumpy.zeros((nsite, nsite))
+
+        # Set values in the upper triangle of the correlation potential matrix for each fragment
+        for fit_ind in fit_inds:
+            ind_fit_0 = fit_ind[ind_triu[0]]
+            ind_fit_1 = fit_ind[ind_triu[1]]
+
+            va = va.at[ind_fit_0, ind_fit_1].set(x[:num_triu])
+            vb = vb.at[ind_fit_0, ind_fit_1].set(x[num_triu:])
+
+        # Symmetrize the correlation potential matrix
+        va_sym = va + jnumpy.transpose(va) - jnumpy.diag(jnumpy.diag(va))
+        vb_sym = vb + jnumpy.transpose(vb) - jnumpy.diag(jnumpy.diag(vb))
+        return jnumpy.array((va_sym, vb_sym))
+
+    def get_density_matrix(f1e):
+        # Ensure that the number of alpha and beta electrons are the same
+        assert nelecs[0] == nelecs[1]
+
+        # Solve the restricted Hartree-Fock problem to get MO energies and coefficients
+        mo_ene_alph, mo_coeff_alph = eigh(f1e[0])
+        mo_ene_beta, mo_coeff_beta = eigh(f1e[1])
+
+        # Select indices for occupied orbitals
+        occ_idx_alph = jnumpy.argsort(mo_ene_alph)[:nelecs[0]]
+        occ_idx_beta = jnumpy.argsort(mo_ene_beta)[:nelecs[1]]
+
+        # Obtain occupied MO coefficients
+        coeff_occ_alph = mo_coeff_alph[:, occ_idx_alph]
+        coeff_occ_beta = mo_coeff_beta[:, occ_idx_beta]
+
+        # Calculate alpha and beta RDMs
+        rdm1_fit_alph  = jnumpy.dot(coeff_occ_alph, coeff_occ_alph.T)
+        rdm1_fit_beta  = jnumpy.dot(coeff_occ_beta, coeff_occ_beta.T)
+
+        return rdm1_fit_alph, rdm1_fit_beta
+
+    # Define the loss function based on the specified type
+    if loss_func_type == 1:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the norm of the RDM difference
+            err = jnumpy.linalg.norm(rdm1_err)
+            return err
+
+    elif loss_func_type == 2:
+        def func(x):
+            # Fill the correlation potential and calculate f1e
+            f1e_fit  = f1e + fill_correlation_potential(x)
+            # Obtain the total RDM
+            rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(get_density_matrix(f1e))
+            # Calculate the difference between the target and fitted RDMs
+            rdm1_err = rdm1_tag - rdm1_fit
+            # The loss function is the sum of the norms of the RDM differences for each fragment
+            err = sum([jnumpy.linalg.norm(rdm1_err[fit_ind][:, fit_ind]) for fit_ind in fit_inds])
+            return err
+
+    else:
+        raise ValueError("Invalid loss function type.")
+
+    # Define a class with the loss function and its gradient, as well as the helper functions
+    class _LossFunctionMixin:
+        pass
+
+    f = _LossFunctionMixin()
+
+    # Main results
+    f.func = (lambda x: numpy.array(func(x)))
+    f.grad = (lambda x: numpy.array(jax.grad(func)(x)))
+    f.hess = (lambda x: numpy.array(jax.hessian(func)(x)))
+
+    # Helper functions
+    f._fill_correlation_potential = fill_correlation_potential
+    f._get_density_matrix         = get_density_matrix
+
+    # Other attributes
+    f._f1e      = f1e
+    f._ind_triu = ind_triu
+    f._num_triu = num_triu
+    f._num_parm = num_parm
+
+    # Return an instance of the class
+    return f
+
+from utils import print_matrix
+from utils import RestrictedElectronicStructureProblem
+
+from utils import solve_restricted_hartree_fock
+from utils import solve_unrestricted_hartree_fock
+from utils import solve_direct_spin1_full_configuration_interaction
+
+from hub import build_hub_model
+hub_u = 8.0
+nsite  = 6
+is_debug = True
+
+for nelecs in [(2, 2), (3, 3), (4, 4)]:
+    if is_debug and (not nelecs == (3, 3)):
+        continue
+
+    log = open(f"./log/hub-u-{hub_u:6.4f}-nelec-{nelecs[0]+nelecs[1]}" + ".log", "w")
+
+    hub_obj         = build_hub_model(nsite, nelecs, hub_u)
+    hub_obj.verbose = 4
+    hub_obj.stdout  = log
+    dm0_alph, dm0_beta = (lambda xs: (numpy.diag(xs[0]), numpy.diag(xs[1][::-1])))(numpy.asarray([[1, 0] for _ in range(nsite)]).reshape(2, -1))
+
+    res_rhf = solve_restricted_hartree_fock(hub_obj,   dm0=dm0_alph+dm0_beta)
+    res_uhf = solve_unrestricted_hartree_fock(hub_obj, dm0=(dm0_alph, dm0_beta))
+    res_fci = solve_direct_spin1_full_configuration_interaction(hub_obj)
+
+    ene_rhf = res_rhf.get_ene()
+    ene_uhf = res_uhf.get_ene()
+    ene_fci = res_fci.get_ene()
+
+    r_rdm1_rhf = res_rhf.get_r_rdm1()
+    r_rdm1_uhf = res_uhf.get_r_rdm1()
+    r_rdm1_fci = res_fci.get_r_rdm1()
+    rdm1_tag   = r_rdm1_fci
+
+    for res in [res_rhf, res_uhf, res_fci]:
+        ene    = res.get_ene()
+        r_rdm1 = res.get_r_rdm1()
+        u_rdm1 = res.get_u_rdm1()
+        err    = numpy.linalg.norm(r_rdm1_fci - r_rdm1) / numpy.size(r_rdm1_fci)
+
+        print(f"\n\n{res.__class__.__name__}", file=log)
+        print(f"ene = {ene:12.8f}, dm_err = {err:12.8f}", file=log)
+        print_matrix(r_rdm1,    t="r_rdm1 = ", stdout=log)
+        print_matrix(u_rdm1[0], t="u_rdm1_alph = ", stdout=log)
+        print_matrix(u_rdm1[1], t="u_rdm1_beta = ", stdout=log)
+
+    for igen_loss, gen_loss in enumerate([gen_loss_function_r, gen_loss_function_u]):
+        for (nimp, loss_func_type) in [(2, 1), (2, 2), (nsite, 1)]:
+            if is_debug and (not (igen_loss == 1 and nimp == 2 and loss_func_type == 1)):
+                continue
+            
+            f = gen_loss(
+                hub_obj.h1, rdm1_tag, nelecs=nelecs, loss_func_type=loss_func_type, 
+                fit_inds=numpy.asarray([[i+ifrag*nimp for i in range(nimp)] for ifrag in range(nsite // nimp)])
+                )
+
+            print("\n\n" + "#"*20, file=log)
+            print(f"{gen_loss.__name__}", file=log)
+            print(f"nimp = {nimp}, nsite = {nsite}", file=log)
+            print(f"nelecs = {nelecs}", file=log)
+            print(f"loss_func_type = {loss_func_type}", file=log)
+
+            global count
+            count = 0
+
+            def callback(x, y, accepted):
+                f1e_fit  = f._f1e + f._fill_correlation_potential(x)
+                rdm1_fit = (lambda rdm1: rdm1[0] + rdm1[1])(f._get_density_matrix(f1e_fit))
+                rdm1_err = jnumpy.abs(rdm1_tag - rdm1_fit)
+                err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+                err_max  = jnumpy.max(rdm1_err)
+
+                global count
+                print(f"Loss Function = {y:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+                count += 1
+
+            kwargs = {
+                "method": "bfgs", 
+                "jac": f.grad, 
+                "tol": 1e-6, 
+                "options": {"disp": False, "maxiter": 1000}
+                }
+
+            x0 = numpy.zeros(f._num_parm) + 0.1 * numpy.random.rand(f._num_parm)
+
+            res = basinhopping(
+                f.func, x0, niter=1000, T=0.1, stepsize=0.6, disp=False,
+                callback=callback, minimizer_kwargs=kwargs, 
+                niter_success=100, interval=10, 
+                )
+
+            print(f"\nLoss Function = {res.fun:6.4e}", file=log)
+            print(f"Success = {res.lowest_optimization_result.success}", file=log)
+            print(f"Message = {res.lowest_optimization_result.message}", file=log)
+            print(f"Count = {count}", file=log)
+            print(f"X = {res.x}", file=log)
+            print(res, file=log)
+            print("\n\n" + "#"*20, file=log)#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Darwin', node='Junjies-MacBook-Air.local', release='22.5.0', version='Darwin Kernel Version 22.5.0: Thu Jun  8 22:21:34 PDT 2023; root:xnu-8796.121.3~7/RELEASE_ARM64_T8112', machine='arm64')  Threads 1
+Python 3.11.3 | packaged by conda-forge | (main, Apr  6 2023, 08:58:31) [Clang 14.0.6 ]
+numpy 1.24.3  scipy 1.10.1
+Date: Thu Jul 20 20:36:37 2023
+PySCF version 2.2.1
+PySCF path  /Users/yangjunjie/packages/pyscf/pyscf-2.2.1/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 0
+[INPUT] num. electrons = 6
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+
+nuclear repulsion = 0
+number of shells = 0
+number of NR pGTOs = 0
+number of NR cGTOs = 0
+basis = sto-3g
+ecp = {}
+CPU time:         0.46
+
+
+******** <class 'pyscf.scf.uhf.UHF'> ********
+method = UHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-06
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /var/folders/14/127wb84x5yx1jh4dxrvgcfkm0000gn/T/tmpnvldp5z9
+max_memory 4000 MB (current use 0 MB)
+number electrons alpha = 3  beta = 3
+Overwritten attributes  get_hcore get_ovlp  of <class 'pyscf.scf.uhf.UHF'>
+Set gradient conv threshold to 0.001
+init E= 0
+  alpha nocc = 3  HOMO = -0.123105625617661  LUMO = 8.12310562561766
+  beta  nocc = 3  HOMO = -0.123105625617661  LUMO = 8.12310562561766
+cycle= 1 E= -1.47312115874708  delta_E= -1.47  |g|= 0.176  |ddm|= 0.575
+  alpha nocc = 3  HOMO = 0.0903326183076389  LUMO = 7.90966738169236
+  beta  nocc = 3  HOMO = 0.0903326183076365  LUMO = 7.90966738169237
+cycle= 2 E= -1.47725639450065  delta_E= -0.00414  |g|= 0.0194  |ddm|= 0.0301
+  alpha nocc = 3  HOMO = 0.115471455540606  LUMO = 7.88452854445939
+  beta  nocc = 3  HOMO = 0.115471455540607  LUMO = 7.88452854445939
+cycle= 3 E= -1.47730782420845  delta_E= -5.14e-05  |g|= 7.98e-05  |ddm|= 0.00375
+  alpha nocc = 3  HOMO = 0.115575007304049  LUMO = 7.88442499269594
+  beta  nocc = 3  HOMO = 0.11557500730405  LUMO = 7.88442499269595
+cycle= 4 E= -1.47730782508382  delta_E= -8.75e-10  |g|= 3.74e-10  |ddm|= 1.55e-05
+  alpha nocc = 3  HOMO = 0.115575006874255  LUMO = 7.88442499312574
+  beta  nocc = 3  HOMO = 0.115575006874255  LUMO = 7.88442499312574
+Extra cycle  E= -1.47730782508382  delta_E= -8.88e-16  |g|= 4.3e-11  |ddm|= 6.45e-11
+converged SCF energy = -1.47730782508382  <S^2> = 2.6463192  2S+1 = 3.4037151
+
+
+RestrictedHartreeFock
+ene =   4.00000000, dm_err =   0.03751893
+
+r_rdm1 = 
+        #0        #1        #2        #3        #4       
+0       1.00000   0.66667  -0.00000  -0.33333   0.00000
+1       0.66667   1.00000   0.66667  -0.00000  -0.33333
+2      -0.00000   0.66667   1.00000   0.66667   0.00000
+3      -0.33333  -0.00000   0.66667   1.00000   0.66667
+4       0.00000  -0.33333   0.00000   0.66667   1.00000
+5       0.66667   0.00000  -0.33333  -0.00000   0.66667
+        #5       
+0       0.66667
+1       0.00000
+2      -0.33333
+3      -0.00000
+4       0.66667
+5       1.00000
+
+u_rdm1_alph = 
+        #0        #1        #2        #3        #4       
+0       0.50000   0.33333  -0.00000  -0.16667   0.00000
+1       0.33333   0.50000   0.33333  -0.00000  -0.16667
+2      -0.00000   0.33333   0.50000   0.33333   0.00000
+3      -0.16667  -0.00000   0.33333   0.50000   0.33333
+4       0.00000  -0.16667   0.00000   0.33333   0.50000
+5       0.33333   0.00000  -0.16667  -0.00000   0.33333
+        #5       
+0       0.33333
+1       0.00000
+2      -0.16667
+3      -0.00000
+4       0.33333
+5       0.50000
+
+u_rdm1_beta = 
+        #0        #1        #2        #3        #4       
+0       0.50000   0.33333  -0.00000  -0.16667   0.00000
+1       0.33333   0.50000   0.33333  -0.00000  -0.16667
+2      -0.00000   0.33333   0.50000   0.33333   0.00000
+3      -0.16667  -0.00000   0.33333   0.50000   0.33333
+4       0.00000  -0.16667   0.00000   0.33333   0.50000
+5       0.33333   0.00000  -0.16667  -0.00000   0.33333
+        #5       
+0       0.33333
+1       0.00000
+2      -0.16667
+3      -0.00000
+4       0.33333
+5       0.50000
+
+
+UnrestrictedHartreeFock
+ene =  -1.47730783, dm_err =   0.00875290
+
+r_rdm1 = 
+        #0        #1        #2        #3        #4       
+0       1.00000   0.24256   0.00000  -0.01488   0.00000
+1       0.24256   1.00000   0.24256  -0.00000  -0.01488
+2       0.00000   0.24256   1.00000   0.24256   0.00000
+3      -0.01488  -0.00000   0.24256   1.00000   0.24256
+4       0.00000  -0.01488   0.00000   0.24256   1.00000
+5       0.24256  -0.00000  -0.01488  -0.00000   0.24256
+        #5       
+0       0.24256
+1      -0.00000
+2      -0.01488
+3      -0.00000
+4       0.24256
+5       1.00000
+
+u_rdm1_alph = 
+        #0        #1        #2        #3        #4       
+0       0.96919   0.12128  -0.01396  -0.00744  -0.01396
+1       0.12128   0.03081   0.12128   0.01396  -0.00744
+2      -0.01396   0.12128   0.96919   0.12128  -0.01396
+3      -0.00744   0.01396   0.12128   0.03081   0.12128
+4      -0.01396  -0.00744  -0.01396   0.12128   0.96919
+5       0.12128   0.01396  -0.00744   0.01396   0.12128
+        #5       
+0       0.12128
+1       0.01396
+2      -0.00744
+3       0.01396
+4       0.12128
+5       0.03081
+
+u_rdm1_beta = 
+        #0        #1        #2        #3        #4       
+0       0.03081   0.12128   0.01396  -0.00744   0.01396
+1       0.12128   0.96919   0.12128  -0.01396  -0.00744
+2       0.01396   0.12128   0.03081   0.12128   0.01396
+3      -0.00744  -0.01396   0.12128   0.96919   0.12128
+4       0.01396  -0.00744   0.01396   0.12128   0.03081
+5       0.12128  -0.01396  -0.00744  -0.01396   0.12128
+        #5       
+0       0.12128
+1      -0.01396
+2      -0.00744
+3      -0.01396
+4       0.12128
+5       0.96919
+
+
+DirectSpin1FullConfigurationInteraction
+ene =  -2.04813089, dm_err =   0.00000000
+
+r_rdm1 = 
+        #0        #1        #2        #3        #4       
+0       1.00000   0.32714  -0.00000  -0.06223  -0.00000
+1       0.32714   1.00000   0.32714   0.00000  -0.06223
+2      -0.00000   0.32714   1.00000   0.32714  -0.00000
+3      -0.06223   0.00000   0.32714   1.00000   0.32714
+4      -0.00000  -0.06223  -0.00000   0.32714   1.00000
+5       0.32714   0.00000  -0.06223   0.00000   0.32714
+        #5       
+0       0.32714
+1       0.00000
+2      -0.06223
+3       0.00000
+4       0.32714
+5       1.00000
+
+u_rdm1_alph = 
+        #0        #1        #2        #3        #4       
+0       0.50000   0.16357  -0.00000  -0.03112  -0.00000
+1       0.16357   0.50000   0.16357   0.00000  -0.03112
+2      -0.00000   0.16357   0.50000   0.16357  -0.00000
+3      -0.03112   0.00000   0.16357   0.50000   0.16357
+4      -0.00000  -0.03112  -0.00000   0.16357   0.50000
+5       0.16357   0.00000  -0.03112   0.00000   0.16357
+        #5       
+0       0.16357
+1       0.00000
+2      -0.03112
+3       0.00000
+4       0.16357
+5       0.50000
+
+u_rdm1_beta = 
+        #0        #1        #2        #3        #4       
+0       0.50000   0.16357  -0.00000  -0.03112   0.00000
+1       0.16357   0.50000   0.16357  -0.00000  -0.03112
+2      -0.00000   0.16357   0.50000   0.16357   0.00000
+3      -0.03112  -0.00000   0.16357   0.50000   0.16357
+4       0.00000  -0.03112   0.00000   0.16357   0.50000
+5       0.16357  -0.00000  -0.03112   0.00000   0.16357
+        #5       
+0       0.16357
+1      -0.00000
+2      -0.03112
+3       0.00000
+4       0.16357
+5       0.50000
+
+
+####################
+gen_loss_function_u
+nimp = 2, nsite = 6
+nelecs = (3, 3)
+loss_func_type = 1
+Loss Function = 1.3507e+00, Error Mean: 3.7521e-02, Max: 3.4958e-01, Count: 0
+Loss Function = 1.3507e+00, Error Mean: 3.5731e-02, Max: 3.4809e-01, Count: 1
+Loss Function = 1.3507e+00, Error Mean: 2.8084e-02, Max: 2.9780e-01, Count: 2
+Loss Function = 1.3507e+00, Error Mean: 3.0959e-02, Max: 2.7407e-01, Count: 3
+Loss Function = 1.3507e+00, Error Mean: 3.7344e-02, Max: 3.5094e-01, Count: 4
+Loss Function = 1.3507e+00, Error Mean: 2.9392e-02, Max: 3.3837e-01, Count: 5
+Loss Function = 1.3507e+00, Error Mean: 3.1549e-02, Max: 4.1096e-01, Count: 6
+Loss Function = 1.3507e+00, Error Mean: 3.0555e-02, Max: 4.2204e-01, Count: 7
+Loss Function = 1.3507e+00, Error Mean: 3.5669e-02, Max: 5.2015e-01, Count: 8
+Loss Function = 1.3507e+00, Error Mean: 4.4451e-02, Max: 6.3645e-01, Count: 9
+Loss Function = 1.3507e+00, Error Mean: 4.4619e-02, Max: 6.1437e-01, Count: 10
+Loss Function = 1.3507e+00, Error Mean: 4.6369e-02, Max: 6.4173e-01, Count: 11
+Loss Function = 1.3507e+00, Error Mean: 4.4940e-02, Max: 6.1554e-01, Count: 12
+Loss Function = 1.3507e+00, Error Mean: 4.7395e-02, Max: 6.7138e-01, Count: 13
+Loss Function = 1.3507e+00, Error Mean: 4.9604e-02, Max: 7.0502e-01, Count: 14
+Loss Function = 1.3507e+00, Error Mean: 5.1550e-02, Max: 7.4494e-01, Count: 15
+Loss Function = 1.3507e+00, Error Mean: 4.9778e-02, Max: 7.2720e-01, Count: 16
+Loss Function = 1.3507e+00, Error Mean: 5.3775e-02, Max: 7.7400e-01, Count: 17
+Loss Function = 1.3507e+00, Error Mean: 6.1590e-02, Max: 8.1815e-01, Count: 18
+Loss Function = 1.3507e+00, Error Mean: 6.5969e-02, Max: 7.8781e-01, Count: 19
+Loss Function = 1.3507e+00, Error Mean: 5.5859e-02, Max: 6.8330e-01, Count: 20
+Loss Function = 1.3507e+00, Error Mean: 6.4004e-02, Max: 6.8415e-01, Count: 21
+Loss Function = 1.3507e+00, Error Mean: 7.1534e-02, Max: 8.5739e-01, Count: 22
+Loss Function = 1.3507e+00, Error Mean: 7.8356e-02, Max: 9.6602e-01, Count: 23
+Loss Function = 1.3507e+00, Error Mean: 7.8714e-02, Max: 9.3782e-01, Count: 24
+Loss Function = 1.3507e+00, Error Mean: 7.7458e-02, Max: 9.2739e-01, Count: 25
+Loss Function = 1.3507e+00, Error Mean: 7.6639e-02, Max: 8.2923e-01, Count: 26
+Loss Function = 1.3507e+00, Error Mean: 7.8577e-02, Max: 9.0296e-01, Count: 27
+Loss Function = 1.3507e+00, Error Mean: 7.2107e-02, Max: 7.6936e-01, Count: 28
+Loss Function = 1.3507e+00, Error Mean: 6.9140e-02, Max: 7.3651e-01, Count: 29
+Loss Function = 1.3507e+00, Error Mean: 6.5339e-02, Max: 8.0460e-01, Count: 30
+Loss Function = 1.3507e+00, Error Mean: 6.4169e-02, Max: 8.2984e-01, Count: 31
+Loss Function = 1.3507e+00, Error Mean: 7.8194e-02, Max: 1.0176e+00, Count: 32
+Loss Function = 1.3507e+00, Error Mean: 6.2858e-02, Max: 7.9743e-01, Count: 33
+Loss Function = 1.3507e+00, Error Mean: 6.4025e-02, Max: 8.9051e-01, Count: 34
+Loss Function = 1.3507e+00, Error Mean: 6.1236e-02, Max: 8.3383e-01, Count: 35
+Loss Function = 1.3507e+00, Error Mean: 6.7548e-02, Max: 8.6784e-01, Count: 36
+Loss Function = 1.3507e+00, Error Mean: 6.4647e-02, Max: 9.1325e-01, Count: 37
+Loss Function = 1.3507e+00, Error Mean: 5.8531e-02, Max: 8.1663e-01, Count: 38
+Loss Function = 1.3507e+00, Error Mean: 6.8831e-02, Max: 9.3210e-01, Count: 39
+Loss Function = 1.3507e+00, Error Mean: 7.7181e-02, Max: 1.0255e+00, Count: 40
+Loss Function = 1.3507e+00, Error Mean: 7.9603e-02, Max: 1.0342e+00, Count: 41
+Loss Function = 1.3507e+00, Error Mean: 8.4205e-02, Max: 1.1655e+00, Count: 42
+Loss Function = 1.3507e+00, Error Mean: 8.3923e-02, Max: 1.1431e+00, Count: 43
+Loss Function = 1.3507e+00, Error Mean: 8.1008e-02, Max: 1.0998e+00, Count: 44
+Loss Function = 1.3507e+00, Error Mean: 8.3948e-02, Max: 1.1725e+00, Count: 45
+Loss Function = 1.3507e+00, Error Mean: 7.8614e-02, Max: 1.1192e+00, Count: 46
+Loss Function = 1.3507e+00, Error Mean: 8.4683e-02, Max: 1.2305e+00, Count: 47
+Loss Function = 1.3507e+00, Error Mean: 8.0904e-02, Max: 1.1572e+00, Count: 48
+Loss Function = 1.3507e+00, Error Mean: 8.5101e-02, Max: 1.2259e+00, Count: 49
+Loss Function = 1.3507e+00, Error Mean: 8.5491e-02, Max: 1.2355e+00, Count: 50
+Loss Function = 1.3507e+00, Error Mean: 8.7866e-02, Max: 1.2734e+00, Count: 51
+Loss Function = 1.3507e+00, Error Mean: 8.5383e-02, Max: 1.2361e+00, Count: 52
+Loss Function = 1.3507e+00, Error Mean: 8.5118e-02, Max: 1.2350e+00, Count: 53
+Loss Function = 1.3507e+00, Error Mean: 8.5341e-02, Max: 1.2353e+00, Count: 54
+Loss Function = 1.3507e+00, Error Mean: 8.7358e-02, Max: 1.2548e+00, Count: 55
+Loss Function = 1.3507e+00, Error Mean: 8.8041e-02, Max: 1.2618e+00, Count: 56
+Loss Function = 1.3507e+00, Error Mean: 8.7862e-02, Max: 1.2251e+00, Count: 57
+Loss Function = 1.3507e+00, Error Mean: 8.7366e-02, Max: 1.1977e+00, Count: 58
+Loss Function = 1.3507e+00, Error Mean: 8.7694e-02, Max: 1.1611e+00, Count: 59
+Loss Function = 1.3507e+00, Error Mean: 8.7499e-02, Max: 1.1519e+00, Count: 60
+Loss Function = 1.3507e+00, Error Mean: 8.6400e-02, Max: 1.1032e+00, Count: 61
+Loss Function = 1.3507e+00, Error Mean: 8.5353e-02, Max: 1.0917e+00, Count: 62
+Loss Function = 1.3507e+00, Error Mean: 8.2930e-02, Max: 9.7545e-01, Count: 63
+Loss Function = 1.3507e+00, Error Mean: 8.1118e-02, Max: 8.7731e-01, Count: 64
+Loss Function = 1.3507e+00, Error Mean: 7.9619e-02, Max: 8.2856e-01, Count: 65
+Loss Function = 1.3507e+00, Error Mean: 7.5976e-02, Max: 8.4676e-01, Count: 66
+Loss Function = 1.3507e+00, Error Mean: 7.4991e-02, Max: 9.1269e-01, Count: 67
+Loss Function = 1.3507e+00, Error Mean: 7.7645e-02, Max: 8.9137e-01, Count: 68
+Loss Function = 1.3507e+00, Error Mean: 7.6714e-02, Max: 9.1858e-01, Count: 69
+Loss Function = 1.3507e+00, Error Mean: 7.8233e-02, Max: 8.7855e-01, Count: 70
+Loss Function = 1.3507e+00, Error Mean: 7.7801e-02, Max: 8.3873e-01, Count: 71
+Loss Function = 1.3507e+00, Error Mean: 7.9618e-02, Max: 8.5429e-01, Count: 72
+Loss Function = 1.3507e+00, Error Mean: 7.6612e-02, Max: 8.4651e-01, Count: 73
+Loss Function = 1.3507e+00, Error Mean: 8.0985e-02, Max: 8.9950e-01, Count: 74
+Loss Function = 1.3507e+00, Error Mean: 7.9124e-02, Max: 8.3114e-01, Count: 75
+Loss Function = 1.3507e+00, Error Mean: 7.4617e-02, Max: 8.7516e-01, Count: 76
+Loss Function = 1.3507e+00, Error Mean: 7.8756e-02, Max: 8.8407e-01, Count: 77
+Loss Function = 1.3507e+00, Error Mean: 7.7711e-02, Max: 8.3059e-01, Count: 78
+Loss Function = 1.3507e+00, Error Mean: 7.7393e-02, Max: 8.7902e-01, Count: 79
+Loss Function = 1.3507e+00, Error Mean: 8.3273e-02, Max: 9.8340e-01, Count: 80
+Loss Function = 1.3507e+00, Error Mean: 7.8167e-02, Max: 8.9511e-01, Count: 81
+Loss Function = 1.3507e+00, Error Mean: 7.4101e-02, Max: 8.3082e-01, Count: 82
+Loss Function = 1.3507e+00, Error Mean: 7.0447e-02, Max: 9.0906e-01, Count: 83
+Loss Function = 1.3507e+00, Error Mean: 7.3285e-02, Max: 9.5314e-01, Count: 84
+Loss Function = 1.3507e+00, Error Mean: 7.7903e-02, Max: 9.1795e-01, Count: 85
+Loss Function = 1.3507e+00, Error Mean: 7.7772e-02, Max: 9.1355e-01, Count: 86
+Loss Function = 1.3507e+00, Error Mean: 8.0101e-02, Max: 8.4672e-01, Count: 87
+Loss Function = 1.3507e+00, Error Mean: 8.3478e-02, Max: 9.6283e-01, Count: 88
+Loss Function = 1.3507e+00, Error Mean: 8.2225e-02, Max: 9.2458e-01, Count: 89
+Loss Function = 1.3507e+00, Error Mean: 7.8928e-02, Max: 8.3860e-01, Count: 90
+Loss Function = 1.3507e+00, Error Mean: 7.9431e-02, Max: 9.1629e-01, Count: 91
+Loss Function = 1.3507e+00, Error Mean: 7.0414e-02, Max: 7.5529e-01, Count: 92
+Loss Function = 1.3507e+00, Error Mean: 7.7363e-02, Max: 8.9588e-01, Count: 93
+Loss Function = 1.3507e+00, Error Mean: 7.1085e-02, Max: 7.3937e-01, Count: 94
+Loss Function = 1.3507e+00, Error Mean: 6.9038e-02, Max: 8.0814e-01, Count: 95
+Loss Function = 1.3507e+00, Error Mean: 6.6902e-02, Max: 7.0751e-01, Count: 96
+Loss Function = 1.3507e+00, Error Mean: 5.9927e-02, Max: 6.9355e-01, Count: 97
+Loss Function = 1.3507e+00, Error Mean: 5.6848e-02, Max: 6.0823e-01, Count: 98
+Loss Function = 1.3507e+00, Error Mean: 6.1830e-02, Max: 6.4552e-01, Count: 99
+Loss Function = 1.3507e+00, Error Mean: 5.4927e-02, Max: 6.0314e-01, Count: 100
+Loss Function = 1.3507e+00, Error Mean: 5.3626e-02, Max: 6.4073e-01, Count: 101
+
+Loss Function = 1.3507e+00
+Success = True
+Message = Optimization terminated successfully.
+Count = 102
+X = [0.09818073 0.03261164 0.08609637 0.05171889 0.00732762 0.05173804]
+                    message: ['success condition satisfied']
+                    success: True
+                        fun: 1.350682020187378
+                          x: [ 9.818e-02  3.261e-02  8.610e-02  5.172e-02
+                               7.328e-03  5.174e-02]
+                        nit: 101
+      minimization_failures: 0
+                       nfev: 102
+                       njev: 102
+ lowest_optimization_result:  message: Optimization terminated successfully.
+                              success: True
+                               status: 0
+                                  fun: 1.350682020187378
+                                    x: [ 9.818e-02  3.261e-02  8.610e-02
+                                         5.172e-02  7.328e-03  5.174e-02]
+                                  nit: 0
+                                  jac: [ 0.000e+00  0.000e+00  0.000e+00
+                                         0.000e+00  0.000e+00  0.000e+00]
+                             hess_inv: [[1 0 ... 0 0]
+                                        [0 1 ... 0 0]
+                                        ...
+                                        [0 0 ... 1 0]
+                                        [0 0 ... 0 1]]
+                                 nfev: 1
+                                 njev: 1
+
+
+####################

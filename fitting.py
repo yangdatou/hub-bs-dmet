@@ -341,10 +341,13 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
         ene    = res.get_ene()
         r_rdm1 = res.get_r_rdm1()
         u_rdm1 = res.get_u_rdm1()
-        err    = numpy.linalg.norm(r_rdm1_fci - r_rdm1) / numpy.size(r_rdm1_fci)
+
+        dm_err = numpy.abs(r_rdm1_fci - r_rdm1) 
+        err_max = numpy.max(dm_err)
+        err_avg = numpy.linalg.norm(dm_err) / numpy.size(dm_err)
 
         print(f"\n\n{res.__class__.__name__}", file=log)
-        print(f"ene = {ene:12.8f}, dm_err = {err:12.8f}", file=log)
+        print(f"Energy: {ene:6.4f}, Error Max: {err_max:6.4e}, Avg: {err_avg:6.4e}", file=log)
         print_matrix(r_rdm1,    t="r_rdm1 = ", stdout=log)
         print_matrix(u_rdm1[0], t="u_rdm1_alph = ", stdout=log)
         print_matrix(u_rdm1[1], t="u_rdm1_beta = ", stdout=log)

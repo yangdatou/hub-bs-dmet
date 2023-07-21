@@ -496,7 +496,7 @@ from utils import solve_direct_spin1_full_configuration_interaction
 from hub import build_hub_model
 hub_u = 8.0
 nsite  = 6
-is_debug = True
+is_debug = False
 
 for nelecs in [(2, 2), (3, 3), (4, 4)]:
     if is_debug and (not nelecs == (3, 3)):
@@ -571,7 +571,7 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
                     ymin = min(ymin, y)
                 
                 if is_debug:
-                    print(f"count = {count}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = []" + " ".join([f"{xi:6.4f}" for xi in x]) + "]", file=log)
+                    print(f"count = {count:4d}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + " ".join([f"{xi:6.4f}" for xi in x]) + "]")
                 #     print_matrix(f1e_fit[0], t="f1e_fit  = ")
                 #     print_matrix(f1e_fit[1], t="f1e_fit  = ")
                 #     print_matrix(rdm1_fit,   t="rdm1_fit = ")
@@ -579,7 +579,7 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
                 #     assert count != 10
 
 
-                print(f"count = {count}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + ", ".join([f"{xi:6.4f}" for xi in x]+"]"), file=log)
+                print(f"count = {count:4d}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + " ".join([f"{xi:6.4f}" for xi in x])+"]", file=log)
                 count += 1
 
             kwargs = {

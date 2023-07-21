@@ -553,8 +553,9 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
             print(f"nelecs = {nelecs}", file=log)
             print(f"loss_func_type = {loss_func_type}", file=log)
 
-            global count
+            global count, ymin
             count = 0
+            ymin  = None
 
             def callback(x, y, accepted):
                 f1e_fit  = f._f1e + f._fill_correlation_potential(x)
@@ -563,17 +564,22 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
                 err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
                 err_max  = jnumpy.max(rdm1_err)
 
-                global count
+                global count, ymin
+                if ymin is None:
+                    ymin = y
+                else:
+                    ymin = min(ymin, y)
+                
                 if is_debug:
-                    print(f"\nLoss Function = {y:6.4e}, {f.func(x):6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}")
-                    print(f"x = " + " ".join([f"{xi:6.4f}" for xi in x]))
+                    print(f"count = {count}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = []" + " ".join([f"{xi:6.4f}" for xi in x]) + "]", file=log)
                 #     print_matrix(f1e_fit[0], t="f1e_fit  = ")
                 #     print_matrix(f1e_fit[1], t="f1e_fit  = ")
                 #     print_matrix(rdm1_fit,   t="rdm1_fit = ")
                 #     print_matrix(rdm1_err,   t="rdm1_err = ")
                 #     assert count != 10
-                
-                print(f"Loss Function = {y:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+
+
+                print(f"count = {count}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + ", ".join([f"{xi:6.4f}" for xi in x]+"]"), file=log)
                 count += 1
 
             kwargs = {
@@ -598,7 +604,7 @@ for nelecs in [(2, 2), (3, 3), (4, 4)]:
             err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
             err_max  = jnumpy.max(rdm1_err)
 
-            print(f"\nLoss Function = {y:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+            print(f"\nLoss Function = {res.fun:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
             print(f"Success = {res.lowest_optimization_result.success}", file=log)
             print(f"Message = {res.lowest_optimization_result.message}", file=log)
             print(f"x = " + " ".join([f"{xi:6.4f}" for xi in x]), file=log)

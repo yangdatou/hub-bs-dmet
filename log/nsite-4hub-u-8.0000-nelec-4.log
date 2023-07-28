@@ -1,0 +1,1466 @@
+#INFO: **** input file is /Users/yangjunjie/work/hub-bs-dmet/fitting.py ****
+import os, sys, typing
+from typing import List, Tuple, Callable
+sys.path.append(".")
+
+from functools import reduce
+
+import numpy, scipy
+from scipy import linalg
+
+import jax
+from jax import config
+config.update("jax_enable_x64", True)
+config.update("jax_debug_nans", True)
+
+import jax.numpy as jnumpy
+from jax.numpy import diag
+from jax.scipy.linalg import eigh
+from jax.scipy.linalg import block_diag
+from pyscf import lib
+
+# Note: 
+# - The code use spin = 1, 2, 4 to represent the spin symmetry
+#   of the system. The value of spin is used to determine the
+#   shape of all the related matrices and tensors.
+# - The variables ending with "_r" are arrays with shape 
+#   (nsite, nsite), which means they are identical for alpha
+#   and beta spin. "_r" will be omitted if unlikely to cause
+#   confusion. For example, h1e is the one-electron Hamiltonian
+#   for alpha and beta spin.
+# - The density matrices that is a sum of the alpha and beta
+#   will be labbeled as "rho_"; the shape shall be (nsite, nsite).
+#   Other density matrices will be labelled as "rdm1_" with 
+#   the proper suffix. rdm1_r wi
+# - The variables ending with "_s" are with shape (spin, nsite, nsite);
+#   the variables ending with "_g" are arrays with shape 
+#   (2 * nsite, 2 * nsite).
+
+# s_to_g: spin to general
+# g_to_s: general to spin
+# tot: get the total density from the RDM
+
+def v1e_s_to_g(v1e_s: numpy.ndarray, spin=1) -> numpy.ndarray:
+    # s_to_g: spin to general
+    assert spin in [1, 2, 4]
+
+    if v1e_s.ndim == 2:
+        v1e_s = v1e_s[None]
+
+    nsite = v1e_s.shape[-1]
+    assert v1e_s.shape == (spin, nsite, nsite)
+
+    if spin == 1:
+        v1e_aa = v1e_bb = v1e_s[0]
+        v1e_ab = v1e_ba = jnumpy.zeros((nsite, nsite))
+
+    elif spin == 2:
+        v1e_aa = v1e_s[0]
+        v1e_ab = v1e_s[1]
+        v1e_ab = v1e_ba = jnumpy.zeros((nsite, nsite))
+
+    elif spin == 4:
+        v1e_aa = v1e_s[0]
+        v1e_ab = v1e_s[1]
+        v1e_ba = v1e_s[2]
+        v1e_bb = v1e_s[3]
+    
+    v1e_g = jnumpy.block([[v1e_aa, v1e_ab], [v1e_ba, v1e_bb]])
+    return v1e_g
+
+def v1e_g_to_s(v1e_g: numpy.ndarray, spin=1) -> numpy.ndarray:
+    assert spin in [1, 2, 4]
+    nsite = v1e_g.shape[-1] // 2
+
+    v1e_aa = v1e_g.at[:nsite, :nsite]
+    v1e_ab = v1e_g.at[:nsite, nsite:]
+    v1e_ba = v1e_g.at[nsite:, :nsite]
+    v1e_bb = v1e_g.at[nsite:, nsite:]
+
+    v1e_s = jnumpy.zeros((spin, nsite, nsite))
+    if spin == 1:
+        assert jnumpy.allclose(v1e_ab, 0)
+        assert jnumpy.allclose(v1e_ba, 0)
+        assert jnumpy.allclose(v1e_aa, v1e_bb)
+        v1e_s = v1e_aa[None]
+
+    if spin == 2:
+        assert jnumpy.allclose(v1e_ab, 0.0)
+        assert jnumpy.allclose(v1e_ba, 0.0)
+        v1e_s = jnumpy.array([v1e_aa, v1e_ab])
+    
+    if spin == 4:
+        v1e_s = jnumpy.array([v1e_aa, v1e_ab, v1e_ba, v1e_bb])
+
+    assert v1e_s.shape == (spin, nsite, nsite)
+    return v1e_s
+
+class LossFunctionMixin(lib.StreamObject):
+    spin   = None
+
+    def __init__(self, h1e_r: numpy.ndarray, rho_tag: numpy.ndarray, nelecs: Tuple[int, int],
+                 nimp: int = 2, loss_func_type: int = 1, stdout: typing.TextIO = sys.stdout):
+        self.stdout = stdout
+
+        spin = self.spin
+        assert spin in [1, 2, 4]
+
+        # Convert fit_inds to a JAX array and extract dimensions
+        # assume all the fragments have the same number of impurity sites.
+        # fit_inds = jnumpy.asarray(fit_inds)
+        nsite    = h1e_r.shape[0]
+        nfrag    = nsite // nimp
+        assert nfrag * nimp == nsite 
+
+        num_parm  = spin * nimp * (nimp + 1) // 2
+        num_parm -= nimp * (spin == 4)
+        
+        # Ensure that dimensions of f1e and rho_tag match expected dimensions
+        assert h1e_r.shape   == (nsite, nsite)
+        assert rho_tag.shape == (nsite, nsite)
+        h1e_g = block_diag(h1e_r, h1e_r)
+        self.h1e_g = h1e_g
+
+        self.rho_tag  = rho_tag
+        self.nelecs   = nelecs
+        self.loss_func_type = loss_func_type
+
+        self.num_parm = num_parm
+
+        self.nfrag    = nfrag
+        self.nimp     = nimp
+        self.nsite    = nsite
+
+        get_v1e_g = self._gen_get_v1e_g()
+        get_rho   = self._gen_get_rho()
+
+        # Helper functions
+        # self._get_v1es = None # self._gen_get_v1es()
+        # self._get_rdm1 = None # self._gen_get_rdm1()
+        
+        # If the number of fragments is 1, then all the
+        # types of loss functions are equivalent.
+        assert loss_func_type == 1 or nfrag != 1
+
+        from jax.numpy.linalg import norm
+        if loss_func_type == 1:
+            def func(x):
+                # Fill the correlation potential and calculate f1e
+                v1e_g_fit = get_v1e_g(x)
+                f1e_g_fit = h1e_g + v1e_g_fit
+                # Obtain the total RDM
+                rho_fit   = get_rho(f1e_g_fit)
+                # Calculate the difference between the target and fitted RDMs
+                rho_err   = rho_fit - rho_tag
+
+                # The loss function is the norm of the RDM difference
+                return norm(rho_err)
+
+        elif loss_func_type == 2:
+            def func(x):
+                # Fill the correlation potential and calculate f1e
+                v1e_g_fit = get_v1e_g(x)
+                f1e_g_fit = h1e_g + v1e_g_fit
+                # Obtain the total RDM
+                rho_fit   = get_rho(f1e_g_fit)
+                # Calculate the difference between the target and fitted RDMs
+                rho_err   = rho_fit - rho_tag
+                
+                # Get the diagonal blocks of the RDM
+                inds = jnumpy.arange(nsite).reshape(nimp, nfrag)
+                err  = sum([norm(rho_err[jnumpy.ix_(ind, ind)]) for ind in inds])
+                return err
+
+        else:
+            raise ValueError("Invalid loss function type.")
+
+        self.func = func
+        self._dump_info()
+
+    def _dump_info(self):
+        info = self.__dict__
+        class_name = " " + self.__class__.__name__ + " "
+        self.stdout.write("\n\n" + "#" * 20 + class_name + "#" * 20 + "\n")
+        self.stdout.write("Loss Function Info:\n")
+        
+        for k, v in info.items():
+            self.stdout.write(f"{k} = {v}\n")
+
+        self.stdout.write("#" * (40 +  len(class_name)) + "\n")
+
+    def _gen_get_v1e_g(self):
+        raise NotImplementedError
+
+    def _gen_get_rho(self):
+        spin     = self.spin
+        nsite    = self.nsite
+        nimp     = self.nimp
+        nfrag    = self.nfrag
+
+        nelec_tot = self.nelecs[0] + self.nelecs[1]
+
+        def get_rho(f1e_g):
+            assert f1e_g.shape  == (2 * nsite, 2 * nsite)
+            print("f1eg = \n", f1e_g)
+            ene_g, coeff_g = eigh(f1e_g)
+            occ_idx_g = jnumpy.argsort(ene_g)[:nelec_tot]
+            coeff_occ_g = coeff_g[:, occ_idx_g]
+            rho_g = jnumpy.dot(coeff_occ_g, coeff_occ_g.T)
+            rho_aa = rho_g[:nsite, :nsite]
+            rho_bb = rho_g[nsite:, nsite:]
+            return rho_aa + rho_bb
+
+        return get_rho
+
+class RestrictedSpinLossFunction(LossFunctionMixin):
+    spin = 1
+    def _gen_get_v1e_g(self):
+        spin     = self.spin
+        nsite    = self.nsite
+        nimp     = self.nimp
+        nfrag    = self.nfrag
+        num_parm = self.num_parm
+
+        def get_v1e_g(x):
+            assert x.shape == (num_parm,)
+
+            v1e_imp_aa = jnumpy.zeros((nimp, nimp))
+            v1e_imp_aa = v1e_imp_aa.at[jnumpy.triu_indices(nimp)].set(x)
+            v1e_imp_aa = (lambda x: x + x.T - diag(diag(x)))(v1e_imp_aa)
+            v1e_imp_bb = v1e_imp_aa
+
+            v1e_aa = block_diag(*[v1e_imp_aa for _ in range(nfrag)])
+            v1e_bb = v1e_aa
+
+            v1e_g  = block_diag(v1e_aa, v1e_bb)
+            return v1e_g
+
+        return get_v1e_g
+
+class UnrestrictedSpinLossFunction(LossFunctionMixin):
+    spin = 2
+    def _gen_get_v1e_g(self):
+        spin     = self.spin
+        nsite    = self.nsite
+        nimp     = self.nimp
+        nfrag    = self.nfrag
+        num_parm = self.num_parm
+
+        fit_inds = self.fit_inds
+
+        def get_v1e_g(x):
+            assert x.shape == (num_parm,)
+
+            v1e_imp_aa = jnumpy.zeros((nimp, nimp))
+            v1e_imp_aa = v1e_imp_aa.at[jnumpy.triu_indices(nimp)].set(x)
+            v1e_imp_aa = (lambda x: x + x.T - diag(diag(x)))(v1e_imp_aa)
+            v1e_imp_bb = v1e_imp_aa
+
+            v1e_aa = block_diag(*[v1e_imp_aa for _ in range(nfrag)])
+            v1e_bb = v1e_aa
+
+            v1e_g  = block_diag(v1e_aa, v1e_bb)
+            return v1e_g
+
+        return get_v1e_g
+
+class GeneralizedSpinLossFunction(LossFunctionMixin):
+    spin = 4
+
+RLF = RestrictedSpinLossFunction
+ULF = UnrestrictedSpinLossFunction
+GLF = GeneralizedSpinLossFunction
+
+from utils import print_matrix
+from utils import RestrictedElectronicStructureProblem
+
+from utils import solve_restricted_hartree_fock
+from utils import solve_unrestricted_hartree_fock
+from utils import solve_direct_spin1_full_configuration_interaction
+
+from hub import build_hub_model
+hub_u = 8.0
+nsite  = 4
+is_debug = True
+
+for nelecs in [(2, 2), (3, 3), (4, 4)]:
+    if is_debug and (not nelecs == (2, 2)):
+        continue
+
+    log = open(f"./log/nsite-{nsite}hub-u-{hub_u:6.4f}-nelec-{nelecs[0]+nelecs[1]}" + ".log", "w")
+
+    hub_obj         = build_hub_model(nsite, nelecs, hub_u)
+    hub_obj.verbose = 4
+    hub_obj.stdout  = log
+    dm0_alph, dm0_beta = (lambda xs: (numpy.diag(xs[0]), numpy.diag(xs[1][::-1])))(numpy.asarray([[1, 0] for _ in range(nsite)]).reshape(2, -1))
+
+    res_rhf = solve_restricted_hartree_fock(hub_obj,   dm0=dm0_alph+dm0_beta)
+    res_uhf = solve_unrestricted_hartree_fock(hub_obj, dm0=(dm0_alph, dm0_beta))
+    res_fci = solve_direct_spin1_full_configuration_interaction(hub_obj)
+
+    ene_rhf = res_rhf.get_ene()
+    ene_uhf = res_uhf.get_ene()
+    ene_fci = res_fci.get_ene()
+
+    r_rdm1_rhf = res_rhf.get_r_rdm1()
+    r_rdm1_uhf = res_uhf.get_r_rdm1()
+    r_rdm1_fci = res_fci.get_r_rdm1()
+    rho_tag   = r_rdm1_fci
+
+    for res in [res_rhf, res_uhf, res_fci]:
+        ene    = res.get_ene()
+        r_rdm1 = res.get_r_rdm1()
+        u_rdm1 = res.get_u_rdm1()
+
+        dm_err = numpy.abs(r_rdm1_fci - r_rdm1) 
+        err_max = numpy.max(dm_err)
+        err_avg = numpy.linalg.norm(dm_err) / numpy.size(dm_err)
+
+        print(f"\n\n{res.__class__.__name__}", file=log)
+        print(f"Energy: {ene:6.4f}, Error Max: {err_max:6.4e}, Avg: {err_avg:6.4e}", file=log)
+        print_matrix(r_rdm1,    t="r_rdm1 = ", stdout=log)
+        print_matrix(u_rdm1[0], t="u_rdm1_alph = ", stdout=log)
+        print_matrix(u_rdm1[1], t="u_rdm1_beta = ", stdout=log)
+
+    for igen_loss, LF in enumerate([RLF]):
+        for (nimp, loss_func_type) in [(2, 2)]:
+            kwargs   = {"stdout": log, "nimp": nimp, "nelecs": nelecs, "loss_func_type": loss_func_type}
+            lf       = LF(hub_obj.h1, rho_tag, **kwargs)
+
+            print("\n\n" + "#"*20, file=log)
+            print(f"{lf.__class__.__name__}", file=log)
+            print(f"nimp = {nimp}, nsite = {nsite}", file=log)
+            print(f"nelecs = {nelecs}", file=log)
+            print(f"loss_func_type = {loss_func_type}", file=log)
+
+            x0 = numpy.zeros(lf.num_parm)
+
+            global count, ymin
+            count = 0
+            ymin  = None
+
+            def callback(x, y, accepted):
+                # # Fill the correlation potential and calculate f1e
+                # v1es_fit = lf._get_v1es(x)
+                # f1es_fit = lf.h1e_s + v1es_fit
+                # # Obtain the total RDM
+                # rho_fit, gdm1_fit = lf._get_rdm1(f1es_fit)
+                # # Calculate the difference between the target and fitted RDMs
+                # rdm1_err = jnumpy.abs(rho_tag - rho_fit)
+
+                # err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+                # err_max  = jnumpy.max(rdm1_err)
+
+                global count, ymin
+                ymin = y if ymin is None else min(ymin, y)
+                
+                # if is_debug:
+                    # print(f"count = {count:4d}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + " ".join([f"{xi:6.4f}" for xi in x]) + "]")
+                #     log.write(f"#{count:4d} {y:6.4e} {accepted}\n")
+                #     log.write(f"x = {x}\n")
+                #     print_matrix(v1es_fit[0], t="v1es_fit_aa = ", stdout=log)
+                #     print_matrix(v1es_fit[3], t="v1es_fit_bb = ", stdout=log)
+                #     print_matrix(v1es_fit[1], t="v1es_fit_ab = ", stdout=log)
+                #     print_matrix(v1es_fit[2], t="v1es_fit_ba = ", stdout=log)
+
+                print(f"count = {count:4d}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + " ".join([f"{xi:6.4f}" for xi in x])+"]")
+                count += 1
+
+            kwargs = {
+                "method": "bfgs", "tol": 1e-6, 
+                "options": {"maxiter": 1000}, 
+                }
+
+            from minimize import basinhopping
+            res = basinhopping(
+                lf.func, x0, T=0.1, stepsize=2.0, disp=False,
+                callback=callback, minimizer_kwargs=kwargs, 
+                niter=4000, niter_success=100, interval=10, 
+                )
+
+            x = res.x
+            f1es_fit = lf.h1e_s + lf._get_v1es(x)
+            rho_fit = lf._get_rdm1(f1es_fit)[0]
+            rdm1_err = jnumpy.abs(rho_tag - rho_fit)
+            err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+            err_max  = jnumpy.max(rdm1_err)
+
+            print(f"\nLoss Function = {res.fun:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+            print(f"Success = {res.lowest_optimization_result.success}", file=log)
+            print(f"Message = {res.lowest_optimization_result.message}", file=log)
+            print(f"x = " + " ".join([f"{xi:6.4f}" for xi in x]), file=log)
+            
+            print(res, file=log)
+
+            print_matrix(rho_fit,   t="rho_fit = ", stdout=log)
+            print_matrix(rho_tag,   t="rho_tag = ", stdout=log)
+            print("\n\n" + "#"*20, file=log)#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Darwin', node='dhcp-21-213.caltech.edu', release='22.5.0', version='Darwin Kernel Version 22.5.0: Thu Jun  8 22:21:34 PDT 2023; root:xnu-8796.121.3~7/RELEASE_ARM64_T8112', machine='arm64')  Threads 1
+Python 3.11.3 | packaged by conda-forge | (main, Apr  6 2023, 08:58:31) [Clang 14.0.6 ]
+numpy 1.24.3  scipy 1.10.1
+Date: Thu Jul 27 19:10:24 2023
+PySCF version 2.2.1
+PySCF path  /Users/yangjunjie/packages/pyscf/pyscf-2.2.1/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 0
+[INPUT] num. electrons = 4
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+
+nuclear repulsion = 0
+number of shells = 0
+number of NR pGTOs = 0
+number of NR cGTOs = 0
+basis = sto-3g
+ecp = {}
+CPU time:         0.46
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-06
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /var/folders/14/127wb84x5yx1jh4dxrvgcfkm0000gn/T/tmpkc2c11yl
+max_memory 4000 MB (current use 0 MB)
+Overwritten attributes  get_ovlp get_hcore  of <class 'pyscf.scf.hf.RHF'>
+Set gradient conv threshold to 0.001
+init E= 8
+
+WARN: HOMO 4 == LUMO 4
+
+cycle= 1 E= 6  delta_E=   -2  |g|=    4  |ddm|=    2
+  HOMO = 2  LUMO = 6
+cycle= 2 E= 11  delta_E=    5  |g|= 7.66  |ddm|= 3.03
+  HOMO = 3.85786437626905  LUMO = 4.14213562373095
+cycle= 3 E= 6.30366975145098  delta_E= -4.7  |g|= 4.56  |ddm|= 0.989
+  HOMO = 3.9022981166172  LUMO = 4.0977018833828
+cycle= 4 E= 6.20469679572927  delta_E= -0.099  |g|= 4.39  |ddm|= 0.0313
+  HOMO = 3.93004735695006  LUMO = 4.06995264304994
+cycle= 5 E= 6.14470792867967  delta_E= -0.06  |g|= 4.28  |ddm|= 0.0196
+  HOMO = 3.9501206723774  LUMO = 4.04987932762259
+cycle= 6 E= 6.10221423949428  delta_E= -0.0425  |g|=  4.2  |ddm|= 0.0142
+  HOMO = 3.96584481900746  LUMO = 4.03415518099254
+cycle= 7 E= 6.06946668177871  delta_E= -0.0327  |g|= 4.14  |ddm|= 0.0111
+  HOMO = 3.97879631675959  LUMO = 4.02120368324041
+cycle= 8 E= 6.0428545353781  delta_E= -0.0266  |g|= 4.08  |ddm|= 0.00916
+  HOMO = 3.98983972606787  LUMO = 4.01016027393213
+cycle= 9 E= 6.02042351449039  delta_E= -0.0224  |g|= 4.04  |ddm|= 0.00781
+  HOMO = 3.60615640221138  LUMO = 4.39384359778862
+cycle= 10 E= 6.92287738252892  delta_E= 0.902  |g|= 5.46  |ddm|= 2.84
+  HOMO = 3.88251165300782  LUMO = 4.11748834699217
+cycle= 11 E= 6.24833426721689  delta_E= -0.675  |g|= 4.46  |ddm|= 0.192
+  HOMO = 3.91920020426954  LUMO = 4.08079979573046
+cycle= 12 E= 6.16798717252823  delta_E= -0.0803  |g|= 4.32  |ddm|= 0.0259
+  HOMO = 3.99466610438748  LUMO = 4.00533389561251
+cycle= 13 E= 6.01069620355266  delta_E= -0.157  |g|= 4.02  |ddm|= 0.0533
+  HOMO = 3.95146270359941  LUMO = 4.04853729640059
+cycle= 14 E= 6.09940067425969  delta_E= 0.0887  |g|= 4.19  |ddm|= 0.0305
+  HOMO = 3.95791007953906  LUMO = 4.04208992046094
+cycle= 15 E= 6.08593208104706  delta_E= -0.0135  |g|= 4.17  |ddm|= 0.00456
+  HOMO = 3.96430813597558  LUMO = 4.03569186402442
+cycle= 16 E= 6.07264591798037  delta_E= -0.0133  |g|= 4.14  |ddm|= 0.00452
+  HOMO = 3.97640343851889  LUMO = 4.02359656148111
+cycle= 17 E= 6.04774656858203  delta_E= -0.0249  |g|= 4.09  |ddm|= 0.00855
+  HOMO = 3.06806040883606  LUMO = 4.93193959116393
+cycle= 18 E= 8.42055382944286  delta_E= 2.37  |g|= 6.85  |ddm|=  2.9
+  HOMO = 3.8100567438986  LUMO = 4.1899432561014
+cycle= 19 E= 6.41398086927561  delta_E= -2.01  |g|= 4.74  |ddm|= 0.48
+  HOMO = 3.86052878477392  LUMO = 4.13947121522608
+cycle= 20 E= 6.29763645744829  delta_E= -0.116  |g|= 4.55  |ddm|= 0.0354
+  HOMO = 3.86410415948737  LUMO = 4.13589584051263
+cycle= 21 E= 6.28955981714882  delta_E= -0.00808  |g|= 4.53  |ddm|= 0.00252
+  HOMO = 3.90846288193354  LUMO = 4.09153711806646
+cycle= 22 E= 6.19124650418899  delta_E= -0.0983  |g|= 4.36  |ddm|= 0.0313
+  HOMO = 3.92477714806339  LUMO = 4.07522285193661
+cycle= 23 E= 6.15599088756003  delta_E= -0.0353  |g|=  4.3  |ddm|= 0.0115
+  HOMO = 3.94241348494725  LUMO = 4.05758651505275
+cycle= 24 E= 6.11843912049658  delta_E= -0.0376  |g|= 4.23  |ddm|= 0.0125
+  HOMO = 3.9750035792194  LUMO = 4.0249964207806
+cycle= 25 E= 6.05061367311002  delta_E= -0.0678  |g|=  4.1  |ddm|= 0.023
+  HOMO = 3.22334559689558  LUMO = 4.77665440310441
+cycle= 26 E= 7.98131545723115  delta_E= 1.93  |g|= 6.53  |ddm|= 2.88
+  HOMO = 3.84006378059317  LUMO = 4.15993621940682
+cycle= 27 E= 6.34429184984942  delta_E= -1.64  |g|= 4.62  |ddm|= 0.41
+  HOMO = 3.94950722025522  LUMO = 4.05049277974478
+cycle= 28 E= 6.10350149152798  delta_E= -0.241  |g|=  4.2  |ddm|= 2.83
+  HOMO = 3.88582051210258  LUMO = 4.11417948789742
+cycle= 29 E= 6.24098763316843  delta_E= 0.137  |g|= 4.45  |ddm|= 2.83
+  HOMO = 3.91044425912691  LUMO = 4.08955574087308
+cycle= 30 E= 6.18693837287156  delta_E= -0.054  |g|= 4.35  |ddm|= 0.0174
+  HOMO = 3.927339992353  LUMO = 4.072660007647
+cycle= 31 E= 6.15049759540173  delta_E= -0.0364  |g|= 4.29  |ddm|= 0.0119
+  HOMO = 3.94068793640312  LUMO = 4.05931206359688
+cycle= 32 E= 6.12208721368749  delta_E= -0.0284  |g|= 4.24  |ddm|= 0.00943
+  HOMO = 3.95551371751946  LUMO = 4.04448628248054
+cycle= 33 E= 6.09092873618593  delta_E= -0.0312  |g|= 4.18  |ddm|= 0.0105
+  HOMO = 3.99218742564788  LUMO = 4.00781257435211
+cycle= 34 E= 6.01568606499598  delta_E= -0.0752  |g|= 4.03  |ddm|= 0.0259
+  HOMO = 3.99030730159681  LUMO = 4.00969269840319
+cycle= 35 E= 6.01947911562864  delta_E= 0.00379  |g|= 4.04  |ddm|= 0.00133
+  HOMO = 3.99900772173189  LUMO = 4.00099227826811
+cycle= 36 E= 6.00198554090793  delta_E= -0.0175  |g|=    4  |ddm|= 0.00615
+  HOMO = 3.01438662244584  LUMO = 4.9856133775542
+cycle= 37 E= 8.57101038848818  delta_E= 2.57  |g|= 6.94  |ddm|=  2.9
+  HOMO = 3.80440535746516  LUMO = 4.19559464253483
+cycle= 38 E= 6.4272717846954  delta_E= -2.14  |g|= 4.76  |ddm|= 0.507
+  HOMO = 3.9295474892703  LUMO = 4.0704525107297
+cycle= 39 E= 6.14577585213821  delta_E= -0.281  |g|= 4.28  |ddm|= 0.0881
+  HOMO = 3.84573733387934  LUMO = 4.15426266612066
+cycle= 40 E= 6.33128543438557  delta_E= 0.186  |g|=  4.6  |ddm|= 0.0591
+  HOMO = 3.90200714646578  LUMO = 4.09799285353422
+cycle= 41 E= 6.20533335654055  delta_E= -0.126  |g|= 4.39  |ddm|= 0.0396
+  HOMO = 3.91507417149937  LUMO = 4.08492582850063
+cycle= 42 E= 6.17689977037162  delta_E= -0.0284  |g|= 4.34  |ddm|= 0.00922
+  HOMO = 3.93422845875535  LUMO = 4.06577154124465
+cycle= 43 E= 6.13579381611957  delta_E= -0.0411  |g|= 4.26  |ddm|= 0.0135
+  HOMO = 3.96921020375515  LUMO = 4.03078979624485
+cycle= 44 E= 6.06252011151568  delta_E= -0.0733  |g|= 4.12  |ddm|= 0.0247
+  HOMO = 3.24015898066474  LUMO = 4.75984101933525
+cycle= 45 E= 7.93364536300509  delta_E= 1.87  |g|= 6.49  |ddm|= 2.88
+  HOMO = 3.84050299932867  LUMO = 4.15949700067132
+cycle= 46 E= 6.34328300000562  delta_E= -1.59  |g|= 4.62  |ddm|=  0.4
+  HOMO = 3.89183250803977  LUMO = 4.10816749196023
+cycle= 47 E= 6.22768962252829  delta_E= -0.116  |g|= 4.43  |ddm|= 0.0361
+  HOMO = 3.83116382014516  LUMO = 4.16883617985484
+cycle= 48 E= 6.36480462984403  delta_E= 0.137  |g|= 4.66  |ddm|= 0.0427
+  HOMO = 3.92902932032959  LUMO = 4.07097067967041
+cycle= 49 E= 6.14688337093369  delta_E= -0.218  |g|= 4.28  |ddm|= 0.0689
+  HOMO = 3.94247539748844  LUMO = 4.05752460251156
+cycle= 50 E= 6.11830833257077  delta_E= -0.0286  |g|= 4.23  |ddm|= 0.0095
+  HOMO = 3.95517126383624  LUMO = 4.04482873616376
+cycle= 51 E= 6.09164369124276  delta_E= -0.0267  |g|= 4.18  |ddm|= 0.00897
+  HOMO = 3.97855386428016  LUMO = 4.02144613571984
+cycle= 52 E= 6.04334969615338  delta_E= -0.0483  |g|= 4.09  |ddm|= 0.0165
+  HOMO = 3.1651407298465  LUMO = 4.8348592701535
+cycle= 53 E= 8.14633547578603  delta_E=  2.1  |g|= 6.65  |ddm|= 2.89
+  HOMO = 3.83095425283922  LUMO = 4.16904574716077
+cycle= 54 E= 6.36528925172417  delta_E= -1.78  |g|= 4.66  |ddm|= 0.438
+  HOMO = 3.88395370532869  LUMO = 4.11604629467131
+cycle= 55 E= 6.24513007682025  delta_E= -0.12  |g|= 4.46  |ddm|= 0.0373
+  HOMO = 3.89117923127833  LUMO = 4.10882076872167
+cycle= 56 E= 6.22913145625788  delta_E= -0.016  |g|= 4.43  |ddm|= 0.00509
+  HOMO = 3.95413123550329  LUMO = 4.04586876449671
+cycle= 57 E= 6.09381638789907  delta_E= -0.135  |g|= 4.18  |ddm|= 0.0444
+  HOMO = 3.81558945091107  LUMO = 4.18441054908893
+cycle= 58 E= 6.40101944984525  delta_E= 0.307  |g|= 4.72  |ddm|= 0.0976
+  HOMO = 3.94436556597495  LUMO = 4.05563443402505
+cycle= 59 E= 6.11431893931308  delta_E= -0.287  |g|= 4.22  |ddm|= 0.0907
+  HOMO = 3.97220474323554  LUMO = 4.02779525676446
+cycle= 60 E= 6.05635759157311  delta_E= -0.058  |g|= 4.11  |ddm|= 0.0197
+  HOMO = 3.19011833542765  LUMO = 4.80988166457235
+cycle= 61 E= 8.07553762245743  delta_E= 2.02  |g|=  6.6  |ddm|= 2.88
+  HOMO = 3.83692286615562  LUMO = 4.16307713384438
+cycle= 62 E= 6.35151580979317  delta_E= -1.72  |g|= 4.64  |ddm|= 0.427
+  HOMO = 3.85816017543044  LUMO = 4.14183982456957
+cycle= 63 E= 6.30299933374316  delta_E= -0.0485  |g|= 4.56  |ddm|= 2.84
+  HOMO = 3.89238319932585  LUMO = 4.10761680067415
+cycle= 64 E= 6.22647480257817  delta_E= -0.0765  |g|= 4.42  |ddm|= 2.83
+  HOMO = 3.92269993584803  LUMO = 4.07730006415197
+cycle= 65 E= 6.16045228518904  delta_E= -0.066  |g|= 4.31  |ddm|= 0.0214
+  HOMO = 3.9536373541702  LUMO = 4.04636264582979
+cycle= 66 E= 6.09484887236376  delta_E= -0.0656  |g|= 4.18  |ddm|= 0.0219
+  HOMO = 3.95741964263854  LUMO = 4.04258035736146
+cycle= 67 E= 6.08695378885262  delta_E= -0.0079  |g|= 4.17  |ddm|= 0.00267
+  HOMO = 3.98074680829132  LUMO = 4.01925319170868
+cycle= 68 E= 6.03887525465778  delta_E= -0.0481  |g|= 4.08  |ddm|= 0.0165
+  HOMO = 3.96423335910032  LUMO = 4.03576664089969
+cycle= 69 E= 6.07280074062615  delta_E= 0.0339  |g|= 4.14  |ddm|= 2.83
+  HOMO = 3.96994191036116  LUMO = 4.03005808963884
+cycle= 70 E= 6.06101270136744  delta_E= -0.0118  |g|= 4.12  |ddm|= 0.00404
+  HOMO = 3.97850176089201  LUMO = 4.02149823910799
+cycle= 71 E= 6.04345612201155  delta_E= -0.0176  |g|= 4.09  |ddm|= 0.00605
+  HOMO = 3.99375698988119  LUMO = 4.00624301011881
+cycle= 72 E= 6.01252493425051  delta_E= -0.0309  |g|= 4.02  |ddm|= 0.0108
+  HOMO = 3.98914529094207  LUMO = 4.01085470905793
+cycle= 73 E= 6.02182692005666  delta_E= 0.0093  |g|= 4.04  |ddm|= 2.83
+  HOMO = 3.99695426468768  LUMO = 4.00304573531232
+cycle= 74 E= 6.00610074004599  delta_E= -0.0157  |g|= 4.01  |ddm|= 0.00552
+  HOMO = 3.99782866183107  LUMO = 4.00217133816893
+cycle= 75 E= 6.00434738848313  delta_E= -0.00175  |g|= 4.01  |ddm|= 2.83
+  HOMO = 3.99609154471489  LUMO = 4.0039084552851
+cycle= 76 E= 6.00783217161551  delta_E= 0.00348  |g|= 4.02  |ddm|= 0.00123
+  HOMO = 3.99692343651115  LUMO = 4.00307656348885
+cycle= 77 E= 6.0061625849209  delta_E= -0.00167  |g|= 4.01  |ddm|= 2.83
+  HOMO = 3.99652588151932  LUMO = 4.00347411848068
+cycle= 78 E= 6.00696029594602  delta_E= 0.000798  |g|= 4.01  |ddm|= 2.83
+  HOMO = 3.99587304395205  LUMO = 4.00412695604795
+cycle= 79 E= 6.00827092622639  delta_E= 0.00131  |g|= 4.02  |ddm|= 2.83
+  HOMO = 3.99934227195093  LUMO = 4.00065772804906
+cycle= 80 E= 6.00131588863313  delta_E= -0.00696  |g|=    4  |ddm|= 0.00245
+  HOMO = 3.999422890728  LUMO = 4.000577109272
+cycle= 81 E= 6.00115455155103  delta_E= -0.000161  |g|=    4  |ddm|= 5.7e-05
+
+WARN: HOMO 3.99955733639919 == LUMO 4.00044266360081
+
+cycle= 82 E= 6.00088552313098  delta_E= -0.000269  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99980582675779 == LUMO 4.0001941732422
+
+cycle= 83 E= 6.00038838418583  delta_E= -0.000497  |g|=    4  |ddm|= 0.000176
+
+WARN: HOMO 3.99994772933898 == LUMO 4.00005227066102
+
+cycle= 84 E= 6.00010454405422  delta_E= -0.000284  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.9998371649861 == LUMO 4.00016283501391
+
+cycle= 85 E= 6.00032569654198  delta_E= 0.000221  |g|=    4  |ddm|= 7.82e-05
+
+WARN: HOMO 3.99987214926358 == LUMO 4.00012785073642
+
+cycle= 86 E= 6.00025571781813  delta_E= -7e-05  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99957087747465 == LUMO 4.00042912252535
+
+cycle= 87 E= 6.00085842917708  delta_E= 0.000603  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99993958542803 == LUMO 4.00006041457196
+
+cycle= 88 E= 6.00012083279381  delta_E= -0.000738  |g|=    4  |ddm|= 0.000261
+
+WARN: HOMO 3.99974359251232 == LUMO 4.00025640748767
+
+cycle= 89 E= 6.00051288071594  delta_E= 0.000392  |g|=    4  |ddm|= 0.000139
+
+WARN: HOMO 3.99996866234778 == LUMO 4.00003133765222
+
+cycle= 90 E= 6.00006267628648  delta_E= -0.00045  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99996280283872 == LUMO 4.00003719716127
+
+cycle= 91 E= 6.00007439570617  delta_E= 1.17e-05  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99998825100632 == LUMO 4.00001174899368
+
+cycle= 92 E= 6.0000234981254  delta_E= -5.09e-05  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99993391000604 == LUMO 4.00006608999396
+
+cycle= 93 E= 6.00013218435573  delta_E= 0.000109  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99990781116297 == LUMO 4.00009218883703
+
+cycle= 94 E= 6.00018438617266  delta_E= 5.22e-05  |g|=    4  |ddm|= 1.85e-05
+
+WARN: HOMO 3.99993234151559 == LUMO 4.0000676584844
+
+cycle= 95 E= 6.0001353215464  delta_E= -4.91e-05  |g|=    4  |ddm|= 1.73e-05
+
+WARN: HOMO 3.99996244863387 == LUMO 4.00003755136613
+
+cycle= 96 E= 6.00007510414235  delta_E= -6.02e-05  |g|=    4  |ddm|= 2.13e-05
+
+WARN: HOMO 3.99996435384824 == LUMO 4.00003564615176
+
+cycle= 97 E= 6.00007129357416  delta_E= -3.81e-06  |g|=    4  |ddm|= 1.35e-06
+
+WARN: HOMO 3.99998274528012 == LUMO 4.00001725471988
+
+cycle= 98 E= 6.00003450973747  delta_E= -3.68e-05  |g|=    4  |ddm|= 1.3e-05
+
+WARN: HOMO 3.99998062012395 == LUMO 4.00001937987605
+
+cycle= 99 E= 6.00003876012768  delta_E= 4.25e-06  |g|=    4  |ddm|= 1.5e-06
+
+WARN: HOMO 3.99998189286649 == LUMO 4.00001810713351
+
+cycle= 100 E= 6.00003621459488  delta_E= -2.55e-06  |g|=    4  |ddm|= 9e-07
+  HOMO = 3.00001283290953  LUMO = 4.99998716705977
+cycle= 101 E= 8.61110985742046  delta_E= 2.61  |g|= 6.97  |ddm|=  2.9
+  HOMO = 3.7851725966103  LUMO = 4.21482740338969
+cycle= 102 E= 6.47288727147471  delta_E= -2.14  |g|= 4.83  |ddm|= 0.502
+  HOMO = 3.83712084178761  LUMO = 4.16287915821239
+cycle= 103 E= 6.35105998162458  delta_E= -0.122  |g|= 4.64  |ddm|= 0.0364
+  HOMO = 3.99631822745641  LUMO = 4.00368177254358
+cycle= 104 E= 6.00737708801904  delta_E= -0.344  |g|= 4.01  |ddm|= 0.112
+  HOMO = 3.89858469167962  LUMO = 4.10141530832038
+cycle= 105 E= 6.21283233262726  delta_E= 0.205  |g|=  4.4  |ddm|= 0.069
+  HOMO = 3.91596835224538  LUMO = 4.08403164775462
+cycle= 106 E= 6.17496557639992  delta_E= -0.0379  |g|= 4.33  |ddm|= 0.0123
+  HOMO = 3.93612942650637  LUMO = 4.06387057349363
+cycle= 107 E= 6.13175187074843  delta_E= -0.0432  |g|= 4.25  |ddm|= 0.0142
+  HOMO = 3.97516141210063  LUMO = 4.02483858789937
+cycle= 108 E= 6.05029021736339  delta_E= -0.0815  |g|=  4.1  |ddm|= 0.0276
+  HOMO = 3.2333531032269  LUMO = 4.7666468967731
+cycle= 109 E= 7.95293990274771  delta_E=  1.9  |g|=  6.5  |ddm|= 2.88
+  HOMO = 3.83575025973395  LUMO = 4.16424974026605
+cycle= 110 E= 6.35421703054493  delta_E= -1.6  |g|= 4.64  |ddm|=  0.4
+  HOMO = 3.88557679711025  LUMO = 4.11442320288975
+cycle= 111 E= 6.24152808169299  delta_E= -0.113  |g|= 4.45  |ddm|= 0.0351
+  HOMO = 3.9081668341893  LUMO = 4.09183316581069
+cycle= 112 E= 6.19189082538967  delta_E= -0.0496  |g|= 4.36  |ddm|= 0.0159
+  HOMO = 3.86175141194123  LUMO = 4.13824858805877
+cycle= 113 E= 6.29487207592467  delta_E= 0.103  |g|= 4.54  |ddm|= 0.0327
+  HOMO = 3.94076395940752  LUMO = 4.05923604059248
+cycle= 114 E= 6.12192636923728  delta_E= -0.173  |g|= 4.24  |ddm|= 0.0557
+  HOMO = 3.95289236106331  LUMO = 4.04710763893669
+cycle= 115 E= 6.09640720721154  delta_E= -0.0255  |g|= 4.19  |ddm|= 0.00857
+  HOMO = 3.9751943148776  LUMO = 4.02480568512239
+cycle= 116 E= 6.05022279401679  delta_E= -0.0462  |g|=  4.1  |ddm|= 0.0158
+  HOMO = 3.1698286674646  LUMO = 4.83017133253539
+cycle= 117 E= 8.13305175316263  delta_E= 2.08  |g|= 6.64  |ddm|= 2.89
+  HOMO = 3.83217215947487  LUMO = 4.16782784052512
+cycle= 118 E= 6.36247388771432  delta_E= -1.77  |g|= 4.65  |ddm|= 0.436
+  HOMO = 3.86147623432923  LUMO = 4.13852376567077
+cycle= 119 E= 6.29549402994842  delta_E= -0.067  |g|= 4.54  |ddm|= 0.0206
+  HOMO = 3.94483950652035  LUMO = 4.05516049347965
+cycle= 120 E= 6.11331970825299  delta_E= -0.182  |g|= 4.22  |ddm|= 0.0588
+  HOMO = 3.93312219730934  LUMO = 4.06687780269065
+cycle= 121 E= 6.13814915698716  delta_E= 0.0248  |g|= 4.27  |ddm|= 0.00828
+  HOMO = 3.94068744183567  LUMO = 4.05931255816433
+cycle= 122 E= 6.12208826009661  delta_E= -0.0161  |g|= 4.24  |ddm|= 0.00534
+  HOMO = 3.95597862490363  LUMO = 4.04402137509637
+cycle= 123 E= 6.08995849123153  delta_E= -0.0321  |g|= 4.18  |ddm|= 0.0108
+  HOMO = 3.98525434505688  LUMO = 4.01474565494311
+cycle= 124 E= 6.02970793236419  delta_E= -0.0603  |g|= 4.06  |ddm|= 0.0207
+  HOMO = 3.1821757401897  LUMO = 4.8178242598103
+cycle= 125 E= 8.09805560310568  delta_E= 2.07  |g|= 6.62  |ddm|= 2.88
+  HOMO = 3.826825515224  LUMO = 4.17317448477599
+cycle= 126 E= 6.37485190124212  delta_E= -1.72  |g|= 4.67  |ddm|= 0.425
+  HOMO = 3.85350238638747  LUMO = 4.14649761361253
+cycle= 127 E= 6.31357365399333  delta_E= -0.0613  |g|= 4.57  |ddm|= 0.0187
+  HOMO = 3.87165885405855  LUMO = 4.12834114594144
+cycle= 128 E= 6.27256775432929  delta_E= -0.041  |g|=  4.5  |ddm|= 0.0128
+  HOMO = 3.91585726992082  LUMO = 4.08414273007918
+cycle= 129 E= 6.17520577683335  delta_E= -0.0974  |g|= 4.33  |ddm|= 0.0312
+  HOMO = 3.93007775898094  LUMO = 4.06992224101906
+cycle= 130 E= 6.14464299257949  delta_E= -0.0306  |g|= 4.28  |ddm|= 0.01
+  HOMO = 3.72422190259755  LUMO = 4.27577809740245
+cycle= 131 E= 6.62119654461808  delta_E= 0.477  |g|= 5.05  |ddm|= 2.84
+  HOMO = 3.99112523444272  LUMO = 4.00887476555728
+cycle= 132 E= 6.01782811647649  delta_E= -0.603  |g|= 4.04  |ddm|= 2.84
+  HOMO = 3.93325890305876  LUMO = 4.06674109694124
+cycle= 133 E= 6.13785797163415  delta_E= 0.12  |g|= 4.26  |ddm|= 2.83
+  HOMO = 3.97120496374602  LUMO = 4.02879503625398
+cycle= 134 E= 6.05841310830703  delta_E= -0.0794  |g|= 4.11  |ddm|= 0.0268
+  HOMO = 3.98515802683284  LUMO = 4.01484197316716
+cycle= 135 E= 6.02990340255832  delta_E= -0.0285  |g|= 4.06  |ddm|= 0.00987
+  HOMO = 3.99116207718012  LUMO = 4.00883792281988
+cycle= 136 E= 6.01775378060743  delta_E= -0.0121  |g|= 4.04  |ddm|= 0.00425
+  HOMO = 3.9917377897374  LUMO = 4.0082622102626
+cycle= 137 E= 6.01659254262295  delta_E= -0.00116  |g|= 4.03  |ddm|= 0.000407
+  HOMO = 3.99224536314706  LUMO = 4.00775463685294
+cycle= 138 E= 6.01556929072879  delta_E= -0.00102  |g|= 4.03  |ddm|= 0.000359
+  HOMO = 3.98779851063547  LUMO = 4.01220148936454
+cycle= 139 E= 6.02455139610794  delta_E= 0.00898  |g|= 4.05  |ddm|= 0.00314
+  HOMO = 3.99465502011388  LUMO = 4.00534497988612
+cycle= 140 E= 6.01071849022895  delta_E= -0.0138  |g|= 4.02  |ddm|= 0.00485
+  HOMO = 3.00954702331478  LUMO = 4.99045297668517
+cycle= 141 E= 8.58452164690576  delta_E= 2.57  |g|= 6.95  |ddm|=  2.9
+  HOMO = 3.79138337926224  LUMO = 4.20861662073776
+cycle= 142 E= 6.45809251164231  delta_E= -2.13  |g|= 4.81  |ddm|= 0.501
+  HOMO = 3.84276038497717  LUMO = 4.15723961502283
+cycle= 143 E= 6.33810314249687  delta_E= -0.12  |g|= 4.61  |ddm|= 0.036
+  HOMO = 3.8272275114274  LUMO = 4.1727724885726
+cycle= 144 E= 6.37391957822081  delta_E= 0.0358  |g|= 4.67  |ddm|= 0.0109
+  HOMO = 3.88773748891967  LUMO = 4.11226251108033
+cycle= 145 E= 6.23674037645996  delta_E= -0.137  |g|= 4.44  |ddm|= 0.0426
+  HOMO = 3.90540857972638  LUMO = 4.09459142027361
+cycle= 146 E= 6.19790166512025  delta_E= -0.0388  |g|= 4.37  |ddm|= 0.0125
+  HOMO = 3.92491162917429  LUMO = 4.07508837082571
+cycle= 147 E= 6.15570232986717  delta_E= -0.0422  |g|=  4.3  |ddm|= 0.0138
+  HOMO = 3.95858297131153  LUMO = 4.04141702868847
+cycle= 148 E= 6.08453102855343  delta_E= -0.0712  |g|= 4.16  |ddm|= 0.0238
+  HOMO = 3.25207021771053  LUMO = 4.74792978228946
+cycle= 149 E= 7.89988578013383  delta_E= 1.82  |g|= 6.46  |ddm|= 2.88
+  HOMO = 3.85109570576785  LUMO = 4.14890429423215
+cycle= 150 E= 6.31905210719639  delta_E= -1.58  |g|= 4.58  |ddm|=  0.4
+  HOMO = 3.90456056263618  LUMO = 4.09543943736382
+cycle= 151 E= 6.19975248844202  delta_E= -0.119  |g|= 4.38  |ddm|= 0.0377
+  HOMO = 3.93199197932858  LUMO = 4.06800802067141
+cycle= 152 E= 6.14055789016274  delta_E= -0.0592  |g|= 4.27  |ddm|= 0.0194
+  HOMO = 3.9458243572643  LUMO = 4.0541756427357
+cycle= 153 E= 6.11124467313902  delta_E= -0.0293  |g|= 4.22  |ddm|= 0.00977
+  HOMO = 3.95860094604466  LUMO = 4.04139905395534
+cycle= 154 E= 6.08449361470877  delta_E= -0.0268  |g|= 4.16  |ddm|= 0.00903
+  HOMO = 3.9714692021555  LUMO = 4.0285307978445
+cycle= 155 E= 6.05786965201968  delta_E= -0.0266  |g|= 4.11  |ddm|= 0.0091
+  HOMO = 3.99618525807801  LUMO = 4.00381474192199
+cycle= 156 E= 6.00764402217535  delta_E= -0.0502  |g|= 4.02  |ddm|= 0.0175
+  HOMO = 3.15507214047419  LUMO = 4.84492785952581
+cycle= 157 E= 8.17485751620663  delta_E= 2.17  |g|= 6.68  |ddm|= 2.88
+  HOMO = 3.82666630067382  LUMO = 4.17333369932618
+cycle= 158 E= 6.37522123145859  delta_E= -1.8  |g|= 4.67  |ddm|= 0.441
+  HOMO = 3.8698321333215  LUMO = 4.1301678666785
+cycle= 159 E= 6.27666721746403  delta_E= -0.0986  |g|= 4.51  |ddm|= 0.0303
+  HOMO = 3.87023849460731  LUMO = 4.1297615053927
+cycle= 160 E= 6.27575476643287  delta_E= -0.000912  |g|= 4.51  |ddm|= 0.000286
+  HOMO = 3.91002956128679  LUMO = 4.08997043871321
+cycle= 161 E= 6.18783945620915  delta_E= -0.0879  |g|= 4.36  |ddm|= 0.0281
+  HOMO = 3.92364828505217  LUMO = 4.07635171494782
+cycle= 162 E= 6.15841443709561  delta_E= -0.0294  |g|=  4.3  |ddm|= 0.00961
+  HOMO = 3.9379758466786  LUMO = 4.06202415332139
+cycle= 163 E= 6.12783245909505  delta_E= -0.0306  |g|= 4.25  |ddm|= 0.0101
+  HOMO = 3.96516233771624  LUMO = 4.03483766228375
+cycle= 164 E= 6.07087809726975  delta_E= -0.057  |g|= 4.14  |ddm|= 0.0192
+  HOMO = 3.19795789167594  LUMO = 4.80204210832405
+cycle= 165 E= 8.05330872162022  delta_E= 1.98  |g|= 6.58  |ddm|= 2.88
+  HOMO = 3.83766301512586  LUMO = 4.16233698487414
+cycle= 166 E= 6.34981199624491  delta_E= -1.7  |g|= 4.63  |ddm|= 0.423
+  HOMO = 3.89061213565312  LUMO = 4.10938786434688
+cycle= 167 E= 6.23038370670824  delta_E= -0.119  |g|= 4.43  |ddm|= 0.0373
+  HOMO = 3.82986403365293  LUMO = 4.17013596634707
+cycle= 168 E= 6.36781155831813  delta_E= 0.137  |g|= 4.66  |ddm|= 0.0427
+  HOMO = 3.9805709230186  LUMO = 4.0194290769814
+cycle= 169 E= 6.03923377839034  delta_E= -0.329  |g|= 4.08  |ddm|= 0.106
+  HOMO = 3.94490536037129  LUMO = 4.05509463962871
+cycle= 170 E= 6.11318089942693  delta_E= 0.0739  |g|= 4.22  |ddm|= 0.0252
+  HOMO = 3.9597424787352  LUMO = 4.04025752126479
+cycle= 171 E= 6.08211883013854  delta_E= -0.0311  |g|= 4.16  |ddm|= 0.0105
+  HOMO = 3.98757615522102  LUMO = 4.01242384477898
+cycle= 172 E= 6.02500155686842  delta_E= -0.0571  |g|= 4.05  |ddm|= 0.0197
+  HOMO = 3.17042730512931  LUMO = 4.82957269487069
+cycle= 173 E= 8.13135529796772  delta_E= 2.11  |g|= 6.64  |ddm|= 2.88
+  HOMO = 3.82668259144519  LUMO = 4.17331740855481
+cycle= 174 E= 6.3751834397921  delta_E= -1.76  |g|= 4.67  |ddm|= 0.432
+  HOMO = 3.87845083007456  LUMO = 4.12154916992544
+cycle= 175 E= 6.25737724753946  delta_E= -0.118  |g|= 4.48  |ddm|= 0.0364
+  HOMO = 3.87526507654786  LUMO = 4.12473492345215
+cycle= 176 E= 6.26449211377027  delta_E= 0.00711  |g|= 4.49  |ddm|= 0.00224
+  HOMO = 3.91151889270527  LUMO = 4.08848110729472
+cycle= 177 E= 6.18460481390505  delta_E= -0.0799  |g|= 4.35  |ddm|= 0.0256
+  HOMO = 3.93028251628616  LUMO = 4.06971748371384
+cycle= 178 E= 6.14420569406858  delta_E= -0.0404  |g|= 4.28  |ddm|= 0.0132
+  HOMO = 3.8513397624786  LUMO = 4.1486602375214
+cycle= 179 E= 6.31849609310105  delta_E= 0.174  |g|= 4.58  |ddm|= 2.83
+  HOMO = 3.96782156739705  LUMO = 4.03217843260295
+cycle= 180 E= 6.06538375406716  delta_E= -0.253  |g|= 4.13  |ddm|= 2.83
+  HOMO = 3.97389976758184  LUMO = 4.02610023241816
+cycle= 181 E= 6.05287714102442  delta_E= -0.0125  |g|=  4.1  |ddm|= 2.83
+  HOMO = 3.99483510882851  LUMO = 4.00516489117149
+cycle= 182 E= 6.0103564238435  delta_E= -0.0425  |g|= 4.02  |ddm|= 2.83
+  HOMO = 3.9929509696386  LUMO = 4.0070490303614
+cycle= 183 E= 6.01414766144806  delta_E= 0.00379  |g|= 4.03  |ddm|= 2.83
+  HOMO = 3.99867652512066  LUMO = 4.00132347487934
+cycle= 184 E= 6.00264870076422  delta_E= -0.0115  |g|= 4.01  |ddm|= 2.83
+  HOMO = 3.99016404827092  LUMO = 4.00983595172908
+cycle= 185 E= 6.01976840946437  delta_E= 0.0171  |g|= 4.04  |ddm|= 2.83
+  HOMO = 3.9756967853658  LUMO = 4.0243032146342
+cycle= 186 E= 6.04919341095342  delta_E= 0.0294  |g|=  4.1  |ddm|= 2.83
+  HOMO = 3.98517326708032  LUMO = 4.01482673291968
+cycle= 187 E= 6.02987247246359  delta_E= -0.0193  |g|= 4.06  |ddm|= 2.83
+  HOMO = 3.99938445366696  LUMO = 4.00061554633304
+cycle= 188 E= 6.00123147150503  delta_E= -0.0286  |g|=    4  |ddm|= 2.83
+  HOMO = 3.99674940337827  LUMO = 4.00325059662174
+cycle= 189 E= 6.0065117510107  delta_E= 0.00528  |g|= 4.01  |ddm|= 2.83
+
+WARN: HOMO 3.99955141202462 == LUMO 4.00044858797538
+
+cycle= 190 E= 6.00089737715935  delta_E= -0.00561  |g|=    4  |ddm|= 0.00198
+  HOMO = 3.99917371696546  LUMO = 4.00082628303454
+cycle= 191 E= 6.00165324867159  delta_E= 0.000756  |g|=    4  |ddm|= 2.83
+  HOMO = 3.99692193025219  LUMO = 4.00307806974781
+cycle= 192 E= 6.00616560669857  delta_E= 0.00451  |g|= 4.01  |ddm|= 0.00159
+
+WARN: HOMO 3.99995159587018 == LUMO 4.00004840412982
+
+cycle= 193 E= 6.00009681060258  delta_E= -0.00607  |g|=    4  |ddm|= 0.00214
+
+WARN: HOMO 3.99977709839389 == LUMO 4.00022290160611
+
+cycle= 194 E= 6.00044585289458  delta_E= 0.000349  |g|=    4  |ddm|= 2.83
+  HOMO = 3.99672578515943  LUMO = 4.00327421484057
+cycle= 195 E= 6.00655914136355  delta_E= 0.00611  |g|= 4.01  |ddm|= 0.00216
+
+WARN: HOMO 3.9996723275979 == LUMO 4.0003276724021
+
+cycle= 196 E= 6.0006554521646  delta_E= -0.0059  |g|=    4  |ddm|= 0.00208
+  HOMO = 3.99910749720133  LUMO = 4.00089250279867
+cycle= 197 E= 6.00178580198071  delta_E= 0.00113  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99992859210241 == LUMO 4.00007140789759
+
+cycle= 198 E= 6.00014282089418  delta_E= -0.00164  |g|=    4  |ddm|= 0.000581
+
+WARN: HOMO 3.99959609731222 == LUMO 4.00040390268778
+
+cycle= 199 E= 6.00080796849645  delta_E= 0.000665  |g|=    4  |ddm|= 2.83
+
+WARN: HOMO 3.99998275357623 == LUMO 4.00001724642377
+
+cycle= 200 E= 6.00003449314498  delta_E= -0.000773  |g|=    4  |ddm|= 0.000273
+SCF not converged.
+SCF energy = 6.00003449314498
+#INFO: **** input file is /Users/yangjunjie/work/hub-bs-dmet/fitting.py ****
+import os, sys, typing
+from typing import List, Tuple, Callable
+sys.path.append(".")
+
+from functools import reduce
+
+import numpy, scipy
+from scipy import linalg
+
+import jax
+from jax import config
+config.update("jax_enable_x64", True)
+config.update("jax_debug_nans", True)
+
+import jax.numpy as jnumpy
+from jax.numpy import diag
+from jax.scipy.linalg import eigh
+from jax.scipy.linalg import block_diag
+from pyscf import lib
+
+# Note: 
+# - The code use spin = 1, 2, 4 to represent the spin symmetry
+#   of the system. The value of spin is used to determine the
+#   shape of all the related matrices and tensors.
+# - The variables ending with "_r" are arrays with shape 
+#   (nsite, nsite), which means they are identical for alpha
+#   and beta spin. "_r" will be omitted if unlikely to cause
+#   confusion. For example, h1e is the one-electron Hamiltonian
+#   for alpha and beta spin.
+# - The density matrices that is a sum of the alpha and beta
+#   will be labbeled as "rho_"; the shape shall be (nsite, nsite).
+#   Other density matrices will be labelled as "rdm1_" with 
+#   the proper suffix. rdm1_r wi
+# - The variables ending with "_s" are with shape (spin, nsite, nsite);
+#   the variables ending with "_g" are arrays with shape 
+#   (2 * nsite, 2 * nsite).
+
+# s_to_g: spin to general
+# g_to_s: general to spin
+# tot: get the total density from the RDM
+
+def v1e_s_to_g(v1e_s: numpy.ndarray, spin=1) -> numpy.ndarray:
+    # s_to_g: spin to general
+    assert spin in [1, 2, 4]
+
+    if v1e_s.ndim == 2:
+        v1e_s = v1e_s[None]
+
+    nsite = v1e_s.shape[-1]
+    assert v1e_s.shape == (spin, nsite, nsite)
+
+    if spin == 1:
+        v1e_aa = v1e_bb = v1e_s[0]
+        v1e_ab = v1e_ba = jnumpy.zeros((nsite, nsite))
+
+    elif spin == 2:
+        v1e_aa = v1e_s[0]
+        v1e_ab = v1e_s[1]
+        v1e_ab = v1e_ba = jnumpy.zeros((nsite, nsite))
+
+    elif spin == 4:
+        v1e_aa = v1e_s[0]
+        v1e_ab = v1e_s[1]
+        v1e_ba = v1e_s[2]
+        v1e_bb = v1e_s[3]
+    
+    v1e_g = jnumpy.block([[v1e_aa, v1e_ab], [v1e_ba, v1e_bb]])
+    return v1e_g
+
+def v1e_g_to_s(v1e_g: numpy.ndarray, spin=1) -> numpy.ndarray:
+    assert spin in [1, 2, 4]
+    nsite = v1e_g.shape[-1] // 2
+
+    v1e_aa = v1e_g.at[:nsite, :nsite]
+    v1e_ab = v1e_g.at[:nsite, nsite:]
+    v1e_ba = v1e_g.at[nsite:, :nsite]
+    v1e_bb = v1e_g.at[nsite:, nsite:]
+
+    v1e_s = jnumpy.zeros((spin, nsite, nsite))
+    if spin == 1:
+        assert jnumpy.allclose(v1e_ab, 0)
+        assert jnumpy.allclose(v1e_ba, 0)
+        assert jnumpy.allclose(v1e_aa, v1e_bb)
+        v1e_s = v1e_aa[None]
+
+    if spin == 2:
+        assert jnumpy.allclose(v1e_ab, 0.0)
+        assert jnumpy.allclose(v1e_ba, 0.0)
+        v1e_s = jnumpy.array([v1e_aa, v1e_ab])
+    
+    if spin == 4:
+        v1e_s = jnumpy.array([v1e_aa, v1e_ab, v1e_ba, v1e_bb])
+
+    assert v1e_s.shape == (spin, nsite, nsite)
+    return v1e_s
+
+class LossFunctionMixin(lib.StreamObject):
+    spin   = None
+
+    def __init__(self, h1e_r: numpy.ndarray, rho_tag: numpy.ndarray, nelecs: Tuple[int, int],
+                 nimp: int = 2, loss_func_type: int = 1, stdout: typing.TextIO = sys.stdout):
+        self.stdout = stdout
+
+        spin = self.spin
+        assert spin in [1, 2, 4]
+
+        # Convert fit_inds to a JAX array and extract dimensions
+        # assume all the fragments have the same number of impurity sites.
+        # fit_inds = jnumpy.asarray(fit_inds)
+        nsite    = h1e_r.shape[0]
+        nfrag    = nsite // nimp
+        assert nfrag * nimp == nsite 
+
+        num_parm  = spin * nimp * (nimp + 1) // 2
+        num_parm -= nimp * (spin == 4)
+        
+        # Ensure that dimensions of f1e and rho_tag match expected dimensions
+        assert h1e_r.shape   == (nsite, nsite)
+        assert rho_tag.shape == (nsite, nsite)
+        h1e_g = block_diag(h1e_r, h1e_r)
+        self.h1e_g = h1e_g
+
+        self.rho_tag  = rho_tag
+        self.nelecs   = nelecs
+        self.loss_func_type = loss_func_type
+
+        self.num_parm = num_parm
+
+        self.nfrag    = nfrag
+        self.nimp     = nimp
+        self.nsite    = nsite
+
+        get_v1e_g = self._gen_get_v1e_g()
+        get_rho   = self._gen_get_rho()
+
+        # Helper functions
+        # self._get_v1es = None # self._gen_get_v1es()
+        # self._get_rdm1 = None # self._gen_get_rdm1()
+        
+        # If the number of fragments is 1, then all the
+        # types of loss functions are equivalent.
+        assert loss_func_type == 1 or nfrag != 1
+
+        from jax.numpy.linalg import norm
+        if loss_func_type == 1:
+            def func(x):
+                # Fill the correlation potential and calculate f1e
+                v1e_g_fit = get_v1e_g(x)
+                f1e_g_fit = h1e_g + v1e_g_fit
+                # Obtain the total RDM
+                rho_fit   = get_rho(f1e_g_fit)
+                # Calculate the difference between the target and fitted RDMs
+                rho_err   = rho_fit - rho_tag
+
+                # The loss function is the norm of the RDM difference
+                return norm(rho_err)
+
+        elif loss_func_type == 2:
+            def func(x):
+                # Fill the correlation potential and calculate f1e
+                v1e_g_fit = get_v1e_g(x)
+                f1e_g_fit = h1e_g + v1e_g_fit
+                # Obtain the total RDM
+                rho_fit   = get_rho(f1e_g_fit)
+                # Calculate the difference between the target and fitted RDMs
+                rho_err   = rho_fit - rho_tag
+                
+                # Get the diagonal blocks of the RDM
+                inds = jnumpy.arange(nsite).reshape(nimp, nfrag)
+                err  = sum([norm(rho_err[jnumpy.ix_(ind, ind)]) for ind in inds])
+                return err
+
+        else:
+            raise ValueError("Invalid loss function type.")
+
+        self.func = func
+        self._dump_info()
+
+    def _dump_info(self):
+        info = self.__dict__
+        class_name = " " + self.__class__.__name__ + " "
+        self.stdout.write("\n\n" + "#" * 20 + class_name + "#" * 20 + "\n")
+        self.stdout.write("Loss Function Info:\n")
+        
+        for k, v in info.items():
+            self.stdout.write(f"{k} = {v}\n")
+
+        self.stdout.write("#" * (40 +  len(class_name)) + "\n")
+
+    def _gen_get_v1e_g(self):
+        raise NotImplementedError
+
+    def _gen_get_rho(self):
+        spin     = self.spin
+        nsite    = self.nsite
+        nimp     = self.nimp
+        nfrag    = self.nfrag
+
+        nelec_tot = self.nelecs[0] + self.nelecs[1]
+
+        def get_rho(f1e_g):
+            assert f1e_g.shape  == (2 * nsite, 2 * nsite)
+            print("f1eg = \n", f1e_g)
+            ene_g, coeff_g = eigh(f1e_g)
+            occ_idx_g = jnumpy.argsort(ene_g)[:nelec_tot]
+            coeff_occ_g = coeff_g[:, occ_idx_g]
+            rho_g = jnumpy.dot(coeff_occ_g, coeff_occ_g.T)
+            rho_aa = rho_g[:nsite, :nsite]
+            rho_bb = rho_g[nsite:, nsite:]
+            return rho_aa + rho_bb
+
+        return get_rho
+
+class RestrictedSpinLossFunction(LossFunctionMixin):
+    spin = 1
+    def _gen_get_v1e_g(self):
+        spin     = self.spin
+        nsite    = self.nsite
+        nimp     = self.nimp
+        nfrag    = self.nfrag
+        num_parm = self.num_parm
+
+        def get_v1e_g(x):
+            assert x.shape == (num_parm,)
+
+            v1e_imp_aa = jnumpy.zeros((nimp, nimp))
+            v1e_imp_aa = v1e_imp_aa.at[jnumpy.triu_indices(nimp)].set(x)
+            v1e_imp_aa = (lambda x: x + x.T - diag(diag(x)))(v1e_imp_aa)
+            v1e_imp_bb = v1e_imp_aa
+
+            v1e_aa = block_diag(*[v1e_imp_aa for _ in range(nfrag)])
+            v1e_bb = v1e_aa
+
+            v1e_g  = block_diag(v1e_aa, v1e_bb)
+            return v1e_g
+
+        return get_v1e_g
+
+class UnrestrictedSpinLossFunction(LossFunctionMixin):
+    spin = 2
+    def _gen_get_v1e_g(self):
+        spin     = self.spin
+        nsite    = self.nsite
+        nimp     = self.nimp
+        nfrag    = self.nfrag
+        num_parm = self.num_parm
+
+        fit_inds = self.fit_inds
+
+        def get_v1e_g(x):
+            assert x.shape == (num_parm,)
+
+            v1e_imp_aa = jnumpy.zeros((nimp, nimp))
+            v1e_imp_aa = v1e_imp_aa.at[jnumpy.triu_indices(nimp)].set(x)
+            v1e_imp_aa = (lambda x: x + x.T - diag(diag(x)))(v1e_imp_aa)
+            v1e_imp_bb = v1e_imp_aa
+
+            v1e_aa = block_diag(*[v1e_imp_aa for _ in range(nfrag)])
+            v1e_bb = v1e_aa
+
+            v1e_g  = block_diag(v1e_aa, v1e_bb)
+            return v1e_g
+
+        return get_v1e_g
+
+class GeneralizedSpinLossFunction(LossFunctionMixin):
+    spin = 4
+
+RLF = RestrictedSpinLossFunction
+ULF = UnrestrictedSpinLossFunction
+GLF = GeneralizedSpinLossFunction
+
+from utils import print_matrix
+from utils import RestrictedElectronicStructureProblem
+
+from utils import solve_restricted_hartree_fock
+from utils import solve_unrestricted_hartree_fock
+from utils import solve_direct_spin1_full_configuration_interaction
+
+from hub import build_hub_model
+hub_u = 8.0
+nsite  = 4
+is_debug = True
+
+for nelecs in [(2, 2), (3, 3), (4, 4)]:
+    if is_debug and (not nelecs == (2, 2)):
+        continue
+
+    log = open(f"./log/nsite-{nsite}hub-u-{hub_u:6.4f}-nelec-{nelecs[0]+nelecs[1]}" + ".log", "w")
+
+    hub_obj         = build_hub_model(nsite, nelecs, hub_u)
+    hub_obj.verbose = 4
+    hub_obj.stdout  = log
+    dm0_alph, dm0_beta = (lambda xs: (numpy.diag(xs[0]), numpy.diag(xs[1][::-1])))(numpy.asarray([[1, 0] for _ in range(nsite)]).reshape(2, -1))
+
+    res_rhf = solve_restricted_hartree_fock(hub_obj,   dm0=dm0_alph+dm0_beta)
+    res_uhf = solve_unrestricted_hartree_fock(hub_obj, dm0=(dm0_alph, dm0_beta))
+    res_fci = solve_direct_spin1_full_configuration_interaction(hub_obj)
+
+    ene_rhf = res_rhf.get_ene()
+    ene_uhf = res_uhf.get_ene()
+    ene_fci = res_fci.get_ene()
+
+    r_rdm1_rhf = res_rhf.get_r_rdm1()
+    r_rdm1_uhf = res_uhf.get_r_rdm1()
+    r_rdm1_fci = res_fci.get_r_rdm1()
+    rho_tag   = r_rdm1_fci
+
+    for res in [res_rhf, res_uhf, res_fci]:
+        ene    = res.get_ene()
+        r_rdm1 = res.get_r_rdm1()
+        u_rdm1 = res.get_u_rdm1()
+
+        dm_err = numpy.abs(r_rdm1_fci - r_rdm1) 
+        err_max = numpy.max(dm_err)
+        err_avg = numpy.linalg.norm(dm_err) / numpy.size(dm_err)
+
+        print(f"\n\n{res.__class__.__name__}", file=log)
+        print(f"Energy: {ene:6.4f}, Error Max: {err_max:6.4e}, Avg: {err_avg:6.4e}", file=log)
+        print_matrix(r_rdm1,    t="r_rdm1 = ", stdout=log)
+        print_matrix(u_rdm1[0], t="u_rdm1_alph = ", stdout=log)
+        print_matrix(u_rdm1[1], t="u_rdm1_beta = ", stdout=log)
+
+    for igen_loss, LF in enumerate([RLF]):
+        for (nimp, loss_func_type) in [(2, 2)]:
+            kwargs   = {"stdout": log, "nimp": nimp, "nelecs": nelecs, "loss_func_type": loss_func_type}
+            lf       = LF(hub_obj.h1, rho_tag, **kwargs)
+
+            print("\n\n" + "#"*20, file=log)
+            print(f"{lf.__class__.__name__}", file=log)
+            print(f"nimp = {nimp}, nsite = {nsite}", file=log)
+            print(f"nelecs = {nelecs}", file=log)
+            print(f"loss_func_type = {loss_func_type}", file=log)
+
+            x0 = numpy.zeros(lf.num_parm)
+
+            global count, ymin
+            count = 0
+            ymin  = None
+
+            def callback(x, y, accepted):
+                # # Fill the correlation potential and calculate f1e
+                # v1es_fit = lf._get_v1es(x)
+                # f1es_fit = lf.h1e_s + v1es_fit
+                # # Obtain the total RDM
+                # rho_fit, gdm1_fit = lf._get_rdm1(f1es_fit)
+                # # Calculate the difference between the target and fitted RDMs
+                # rdm1_err = jnumpy.abs(rho_tag - rho_fit)
+
+                # err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+                # err_max  = jnumpy.max(rdm1_err)
+
+                global count, ymin
+                ymin = y if ymin is None else min(ymin, y)
+                
+                # if is_debug:
+                    # print(f"count = {count:4d}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + " ".join([f"{xi:6.4f}" for xi in x]) + "]")
+                #     log.write(f"#{count:4d} {y:6.4e} {accepted}\n")
+                #     log.write(f"x = {x}\n")
+                #     print_matrix(v1es_fit[0], t="v1es_fit_aa = ", stdout=log)
+                #     print_matrix(v1es_fit[3], t="v1es_fit_bb = ", stdout=log)
+                #     print_matrix(v1es_fit[1], t="v1es_fit_ab = ", stdout=log)
+                #     print_matrix(v1es_fit[2], t="v1es_fit_ba = ", stdout=log)
+
+                print(f"count = {count:4d}, y = {y:6.4e}, ymin = {ymin:6.4e}, " + f"x = [" + " ".join([f"{xi:6.4f}" for xi in x])+"]")
+                count += 1
+
+            kwargs = {
+                "method": "bfgs", "tol": 1e-6, 
+                "options": {"maxiter": 1000}, 
+                }
+
+            from minimize import basinhopping
+            res = basinhopping(
+                lf.func, x0, T=0.1, stepsize=2.0, disp=False,
+                callback=callback, minimizer_kwargs=kwargs, 
+                niter=4000, niter_success=100, interval=10, 
+                )
+
+            x = res.x
+            f1es_fit = lf.h1e_s + lf._get_v1es(x)
+            rho_fit = lf._get_rdm1(f1es_fit)[0]
+            rdm1_err = jnumpy.abs(rho_tag - rho_fit)
+            err_mean = jnumpy.linalg.norm(rdm1_err) / numpy.size(rdm1_err)
+            err_max  = jnumpy.max(rdm1_err)
+
+            print(f"\nLoss Function = {res.fun:6.4e}, Error Mean: {err_mean:6.4e}, Max: {err_max:6.4e}, Count: {count}", file=log)
+            print(f"Success = {res.lowest_optimization_result.success}", file=log)
+            print(f"Message = {res.lowest_optimization_result.message}", file=log)
+            print(f"x = " + " ".join([f"{xi:6.4f}" for xi in x]), file=log)
+            
+            print(res, file=log)
+
+            print_matrix(rho_fit,   t="rho_fit = ", stdout=log)
+            print_matrix(rho_tag,   t="rho_tag = ", stdout=log)
+            print("\n\n" + "#"*20, file=log)#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Darwin', node='dhcp-21-213.caltech.edu', release='22.5.0', version='Darwin Kernel Version 22.5.0: Thu Jun  8 22:21:34 PDT 2023; root:xnu-8796.121.3~7/RELEASE_ARM64_T8112', machine='arm64')  Threads 1
+Python 3.11.3 | packaged by conda-forge | (main, Apr  6 2023, 08:58:31) [Clang 14.0.6 ]
+numpy 1.24.3  scipy 1.10.1
+Date: Thu Jul 27 19:10:24 2023
+PySCF version 2.2.1
+PySCF path  /Users/yangjunjie/packages/pyscf/pyscf-2.2.1/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 0
+[INPUT] num. electrons = 4
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+
+nuclear repulsion = 0
+number of shells = 0
+number of NR pGTOs = 0
+number of NR cGTOs = 0
+basis = sto-3g
+ecp = {}
+CPU time:         0.62
+
+
+******** <class 'pyscf.scf.uhf.UHF'> ********
+method = UHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-06
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /var/folders/14/127wb84x5yx1jh4dxrvgcfkm0000gn/T/tmpnlkx__8g
+max_memory 4000 MB (current use 0 MB)
+number electrons alpha = 2  beta = 2
+Overwritten attributes  get_ovlp get_hcore  of <class 'pyscf.scf.uhf.UHF'>
+Set gradient conv threshold to 0.001
+init E= 0
+  alpha nocc = 2  HOMO = -2.45445421352071e-16  LUMO = 8
+  beta  nocc = 2  HOMO = -1.40675524453476e-34  LUMO = 8
+cycle= 1 E= -0.966563145999495  delta_E= -0.967  |g|= 0.134  |ddm|= 0.46
+  alpha nocc = 2  HOMO = 0.211145618000168  LUMO = 7.78885438199983
+  beta  nocc = 2  HOMO = 0.211145618000169  LUMO = 7.78885438199983
+cycle= 2 E= -0.968847558364959  delta_E= -0.00228  |g|= 0.0133  |ddm|= 0.022
+  alpha nocc = 2  HOMO = 0.233522306341323  LUMO = 7.76647769365867
+  beta  nocc = 2  HOMO = 0.233522306341323  LUMO = 7.76647769365867
+cycle= 3 E= -0.968870663300623  delta_E= -2.31e-05  |g|= 4.2e-05  |ddm|= 0.00245
+  alpha nocc = 2  HOMO = 0.233561379175357  LUMO = 7.76643862082464
+  beta  nocc = 2  HOMO = 0.233561379175356  LUMO = 7.76643862082464
+cycle= 4 E= -0.968870663485498  delta_E= -1.85e-10  |g|= 1.88e-05  |ddm|= 4.3e-06
+  alpha nocc = 2  HOMO = 0.233589727576511  LUMO = 7.76641027242349
+  beta  nocc = 2  HOMO = 0.23358972757651  LUMO = 7.76641027242349
+Extra cycle  E= -0.968870663531223  delta_E= -4.57e-11  |g|= 1.94e-06  |ddm|= 3.12e-06
+converged SCF energy = -0.968870663531223  <S^2> = 1.7800487  2S+1 = 2.8495956
+
+
+RestrictedHartreeFock
+Energy: 6.0000, Error Max: 5.0000e-01, Avg: 9.5528e-02
+
+r_rdm1 = 
+        #0        #1        #2        #3       
+0       0.50000   0.50000   0.50000   0.50000
+1       0.50000   1.50000   0.50000  -0.50000
+2       0.50000   0.50000   0.50000   0.50000
+3       0.50000  -0.50000   0.50000   1.50000
+
+u_rdm1_alph = 
+        #0        #1        #2        #3       
+0       0.25000   0.25000   0.25000   0.25000
+1       0.25000   0.75000   0.25000  -0.25000
+2       0.25000   0.25000   0.25000   0.25000
+3       0.25000  -0.25000   0.25000   0.75000
+
+u_rdm1_beta = 
+        #0        #1        #2        #3       
+0       0.25000   0.25000   0.25000   0.25000
+1       0.25000   0.75000   0.25000  -0.25000
+2       0.25000   0.25000   0.25000   0.25000
+3       0.25000  -0.25000   0.25000   0.75000
+
+
+UnrestrictedHartreeFock
+Energy: -0.9689, Error Max: 6.0526e-02, Avg: 1.0700e-02
+
+r_rdm1 = 
+        #0        #1        #2        #3       
+0       1.00000   0.23449  -0.00000   0.23449
+1       0.23449   1.00000   0.23449   0.00000
+2      -0.00000   0.23449   1.00000   0.23449
+3       0.23449   0.00000   0.23449   1.00000
+
+u_rdm1_alph = 
+        #0        #1        #2        #3       
+0       0.97080   0.11725  -0.02920   0.11725
+1       0.11725   0.02920   0.11725   0.02920
+2      -0.02920   0.11725   0.97080   0.11725
+3       0.11725   0.02920   0.11725   0.02920
+
+u_rdm1_beta = 
+        #0        #1        #2        #3       
+0       0.02920   0.11725   0.02920   0.11725
+1       0.11725   0.97080   0.11725  -0.02920
+2       0.02920   0.11725   0.02920   0.11725
+3       0.11725  -0.02920   0.11725   0.97080
+
+
+DirectSpin1FullConfigurationInteraction
+Energy: -1.3202, Error Max: 0.0000e+00, Avg: 0.0000e+00
+
+r_rdm1 = 
+        #0        #1        #2        #3       
+0       1.00000   0.29502  -0.00000   0.29502
+1       0.29502   1.00000   0.29502   0.00000
+2      -0.00000   0.29502   1.00000   0.29502
+3       0.29502   0.00000   0.29502   1.00000
+
+u_rdm1_alph = 
+        #0        #1        #2        #3       
+0       0.50000   0.14751  -0.00000   0.14751
+1       0.14751   0.50000   0.14751   0.00000
+2      -0.00000   0.14751   0.50000   0.14751
+3       0.14751   0.00000   0.14751   0.50000
+
+u_rdm1_beta = 
+        #0        #1        #2        #3       
+0       0.50000   0.14751   0.00000   0.14751
+1       0.14751   0.50000   0.14751  -0.00000
+2       0.00000   0.14751   0.50000   0.14751
+3       0.14751  -0.00000   0.14751   0.50000
+
+
+#################### RestrictedSpinLossFunction ####################
+Loss Function Info:
+stdout = <_io.TextIOWrapper name='./log/nsite-4hub-u-8.0000-nelec-4.log' mode='w' encoding='UTF-8'>
+h1e_g = [[ 0. -1.  0. -1.  0.  0.  0.  0.]
+ [-1.  0. -1.  0.  0.  0.  0.  0.]
+ [ 0. -1.  0. -1.  0.  0.  0.  0.]
+ [-1.  0. -1.  0.  0.  0.  0.  0.]
+ [ 0.  0.  0.  0.  0. -1.  0. -1.]
+ [ 0.  0.  0.  0. -1.  0. -1.  0.]
+ [ 0.  0.  0.  0.  0. -1.  0. -1.]
+ [ 0.  0.  0.  0. -1.  0. -1.  0.]]
+rho_tag = [[ 1.00000000e+00  2.95021261e-01 -1.48168099e-17  2.95021261e-01]
+ [ 2.95021261e-01  1.00000000e+00  2.95021261e-01  1.26644877e-17]
+ [-1.48168099e-17  2.95021261e-01  1.00000000e+00  2.95021261e-01]
+ [ 2.95021261e-01  1.26644877e-17  2.95021261e-01  1.00000000e+00]]
+nelecs = (2, 2)
+loss_func_type = 2
+num_parm = 3
+nfrag = 2
+nimp = 2
+nsite = 4
+func = <function LossFunctionMixin.__init__.<locals>.func at 0x111871940>
+####################################################################
+
+
+####################
+RestrictedSpinLossFunction
+nimp = 2, nsite = 4
+nelecs = (2, 2)
+loss_func_type = 2
